@@ -1,187 +1,103 @@
 --!strict
--- Wild Horse Scanner (Client) — StarterPlayerScripts → LocalScript
+-- Horse Overhead Info (Client-only overlays for horse-like species)
+-- Toggle with H
+-- StarterPlayerScripts → LocalScript
 
-local Players                  = game:GetService("Players")
-local CollectionService        = game:GetService("CollectionService")
-local ProximityPromptService   = game:GetService("ProximityPromptService")
-local RunService               = game:GetService("RunService")
-local Workspace                = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UIS = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 
--- ============== CONFIG ============
+-- ======== CONFIG ========
 local CONFIG = {
-    SCAN_RADIUS = 300,               -- studs
-    SCAN_INTERVAL = 0.35,            -- seconds
-    HORSE_TAGS = { "Horse", "WildHorse" },
-    HORSE_NAME_CONTAINS = { "Horse", "Mustang", "Wild" },
-    MAX_PARTS_FOR_COLOR = 30,        -- limit color sampling to be cheap
-    REQUIRE_LINE_OF_SIGHT = false,   -- set true if you only want visible horses
-    UI_MAX_ROWS = 10,
+    SCAN_INTERVAL = 0.3,
+    MAX_RADIUS = 350,         -- only show overlays for horses within this many studs
+    TEXT_SIZE = 14,
+    MAX_LINES = 3,
+    TAGS = { "Horse", "WildHorse", "Mount", "Tameable" }, -- if game uses tags
+    NAME_MATCH = { "Horse","Unicorn","Gargoyle","Equus","Bisorse","Pony","Caprine","Kelpie","Peryton","Fae","Plush","Flora","Cybred","Celestial","Saurequine","Hippocampus","Kirin","Cactaline","Clydesdale","Felorse","Akhal","Teke" },
+    ATTR_SPECIES_KEY = "Species", -- common in many games
+    ATTR_WILD_KEY    = "Wild",
+    ATTR_TAMED_KEY   = "Tamed",
+    ATTR_OWNER_KEYS  = { "Owner","OwnerName" },
+    UI_OFFSET_Y = 4,          -- studs above head/root
+    REQUIRE_ROOT = true,      -- true = needs a HumanoidRootPart or similar
 }
 
--- ============== UI SETUP =========
-local function makeUI()
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "WildHorseScanner"
-    sg.ResetOnSpawn = false
-    sg.IgnoreGuiInset = true
-    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-    local frame = Instance.new("Frame")
-    frame.Name = "Panel"
-    frame.AnchorPoint = Vector2.new(0, 0)
-    frame.Position = UDim2.new(0, 10, 0, 40)
-    frame.Size = UDim2.new(0, 360, 0, 260)
-    frame.BackgroundTransparency = 0.25
-    frame.BackgroundColor3 = Color3.fromRGB(18,18,18)
-    frame.BorderSizePixel = 0
-    frame.Parent = sg
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -10, 0, 22)
-    title.Position = UDim2.new(0, 10, 0, 6)
-    title.BackgroundTransparency = 1
-    title.Font = Enum.Font.Code
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.fromRGB(235, 255, 235)
-    title.TextSize = 16
-    title.Text = "Wild Horse Scanner"
-    title.Parent = frame
-
-    local scrolling = Instance.new("ScrollingFrame")
-    scrolling.Name = "List"
-    scrolling.Position = UDim2.new(0, 10, 0, 32)
-    scrolling.Size = UDim2.new(1, -20, 1, -42)
-    scrolling.CanvasSize = UDim2.new(0, 0, 0, 0)
-    scrolling.ScrollBarThickness = 6
-    scrolling.Active = true
-    scrolling.BackgroundTransparency = 0.35
-    scrolling.BackgroundColor3 = Color3.fromRGB(25,25,25)
-    scrolling.BorderSizePixel = 0
-    scrolling.Parent = frame
-
-    local template = Instance.new("TextLabel")
-    template.Name = "RowTemplate"
-    template.Visible = false
-    template.Size = UDim2.new(1, -8, 0, 22)
-    template.BackgroundTransparency = 1
-    template.Font = Enum.Font.Code
-    template.TextXAlignment = Enum.TextXAlignment.Left
-    template.TextColor3 = Color3.fromRGB(235,235,235)
-    template.TextSize = 14
-    template.Text = ""
-    template.Parent = scrolling
-
-    sg.Parent = LP:WaitForChild("PlayerGui")
-    return scrolling, template, title
+-- ======== Helpers ========
+local function getChar()
+    return LP.Character or LP.CharacterAdded:Wait()
 end
-
-local List, RowTemplate, Title = makeUI()
-
--- ============== HELPERS ===========
-local function getCharacter()
-    local c = LP.Character or LP.CharacterAdded:Wait()
-    return c
+local function hrpOf(m: Model): BasePart?
+    return m:FindFirstChild("HumanoidRootPart")
+        or m:FindFirstChild("Torso")
+        or m:FindFirstChildWhichIsA("BasePart")
 end
-
-local function hrpOf(model: Model): BasePart?
-    return model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso") or model:FindFirstChildWhichIsA("BasePart")
-end
-
-local function instancePath(inst: Instance): string
-    local parts = {}
-    local cur: Instance? = inst
-    while cur do
-        table.insert(parts, 1, cur.Name)
-        cur = cur.Parent
-        if cur == game then break end
-    end
-    return table.concat(parts, ".")
-end
-
-local function isHorseModel(m: Instance): boolean
+local function isPlayerCharacter(m: Instance): boolean
     if not m:IsA("Model") then return false end
-    for _, t in ipairs(CONFIG.HORSE_TAGS) do
-        if CollectionService:HasTag(m, t) then
-            return true
-        end
-    end
-    local lower = string.lower(m.Name)
-    for _, frag in ipairs(CONFIG.HORSE_NAME_CONTAINS) do
-        if string.find(lower, string.lower(frag)) then
-            return true
+    if Players:GetPlayerFromCharacter(m) then return true end
+    local parent = m.Parent
+    if parent and parent.Name == "Characters" then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Name == m.Name then return true end
         end
     end
     return false
 end
-
-local function nearbyCandidates(origin: Vector3): {Model}
-    local out = {}
-    for _, m in ipairs(Workspace:GetDescendants()) do
-        if isHorseModel(m) then
-            local root = hrpOf(m)
-            if root then
-                local d = (root.Position - origin).Magnitude
-                if d <= CONFIG.SCAN_RADIUS then
-                    table.insert(out, m)
-                end
-            end
-        end
+local function hasAnyTag(m: Instance, tags: {string}): boolean
+    for _, t in ipairs(tags) do
+        if CollectionService:HasTag(m, t) then return true end
     end
-    return out
+    return false
 end
-
-local function averageColor(model: Model): Color3?
-    local sumR, sumG, sumB, count = 0,0,0,0
-    local n = 0
-    for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("BasePart") then
-            local c = d.Color
-            sumR += c.R; sumG += c.G; sumB += c.B
-            count += 1
-            n += 1
-            if n >= CONFIG.MAX_PARTS_FOR_COLOR then break end
-        end
+local function nameLooksLikeHorse(s: string): boolean
+    local low = string.lower(s)
+    for _, frag in ipairs(CONFIG.NAME_MATCH) do
+        if low:find(string.lower(frag)) then return true end
     end
-    if count == 0 then return nil end
-    return Color3.new(sumR / count, sumG / count, sumB / count)
+    return false
 end
-
-local function lineOfSight(fromPos: Vector3, toPos: Vector3, ignore: Instance?): boolean
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = { ignore or Workspace.CurrentCamera }
-    local result = Workspace:Raycast(fromPos, (toPos - fromPos), params)
-    if not result then return true end
-    -- If we hit very near the target point, consider LOS true
-    return (result.Position - toPos).Magnitude < 2.0
+local function getAttr(inst: Instance, key: string): any
+    local ok, v = pcall(function() return inst:GetAttribute(key) end)
+    return ok and v or nil
 end
-
-local function findPromptOn(model: Instance)
-    local best, bestName = nil, ""
-    for _, d in ipairs(model:GetDescendants()) do
+local function getFirstAttr(inst: Instance, keys: {string})
+    for _, k in ipairs(keys) do
+        local v = getAttr(inst, k)
+        if v ~= nil then return v end
+    end
+    return nil
+end
+local function nearestPromptInfo(m: Model): string
+    local bestText, bestKey = nil, nil
+    for _, d in ipairs(m:GetDescendants()) do
         if d:IsA("ProximityPrompt") then
-            best = d
-            bestName = d.ActionText ~= "" and d.ActionText or d.ObjectText
+            local act = d.ActionText or ""
+            local obj = d.ObjectText or ""
+            local both = (act ~= "" and act or obj)
+            bestText = both ~= "" and both or "Interact"
+            bestKey = tostring(d.KeyboardKeyCode):gsub("Enum%.KeyCode%.","")
             break
         end
     end
-    return best, bestName
+    if bestText then
+        return ("%s[%s]"):format(bestText, bestKey or "?")
+    end
+    return "n/a"
 end
 
--- Keep simple velocity estimation per model
+-- speed estimate per model
 local lastPos: {[Instance]: Vector3} = {}
 local lastTime: {[Instance]: number} = {}
-
-local function estimateSpeed(model: Model): number
-    local root = hrpOf(model)
+local function estimateSpeed(m: Model): number
+    local root = hrpOf(m)
     if not root then return 0 end
     local now = time()
-    local prevP = lastPos[model]
-    local prevT = lastTime[model]
-    lastPos[model] = root.Position
-    lastTime[model] = now
+    local prevP, prevT = lastPos[m], lastTime[m]
+    lastPos[m], lastTime[m] = root.Position, now
     if prevP and prevT then
         local dt = math.max(1e-3, now - prevT)
         return (root.Position - prevP).Magnitude / dt
@@ -189,160 +105,197 @@ local function estimateSpeed(model: Model): number
     return 0
 end
 
-local function formatColor3(c: Color3?): string
-    if not c then return "n/a" end
-    return string.format("rgb(%d,%d,%d)", math.floor(c.R*255), math.floor(c.G*255), math.floor(c.B*255))
-end
-
--- Read common attributes safely
-local function readAttr(inst: Instance, name: string): any
-    local ok, v = pcall(function() return inst:GetAttribute(name) end)
-    if ok then return v end
-    return nil
-end
-
--- ============== RENDER LIST =========
-local rowPool: {TextLabel} = {}
-
-local function getRow(i: number): TextLabel
-    if not rowPool[i] then
-        local r = RowTemplate:Clone()
-        r.Visible = true
-        r.Position = UDim2.new(0, 0, 0, (i-1)*24)
-        r.Parent = List
-        rowPool[i] = r
+-- Identify horse-like NPCs
+local function isHorseLike(m: Instance): boolean
+    if not m:IsA("Model") then return false end
+    if isPlayerCharacter(m) then return false end
+    if CONFIG.REQUIRE_ROOT and not hrpOf(m) then return false end
+    if hasAnyTag(m, CONFIG.TAGS) then return true end
+    local spec = getAttr(m, CONFIG.ATTR_SPECIES_KEY)
+    if type(spec) == "string" and nameLooksLikeHorse(spec) then return true end
+    if nameLooksLikeHorse(m.Name) then return true end
+    -- look for a Tame/Mount prompt as a hint
+    for _, d in ipairs(m:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local t = string.lower((d.ActionText or "") .. " " .. (d.ObjectText or ""))
+            if t:find("tame") or t:find("mount") or t:find("ride") then
+                return true
+            end
+        end
     end
-    return rowPool[i]
+    return false
 end
 
-local function hideRows(fromIndex: number)
-    for i = fromIndex, #rowPool do
-        if rowPool[i] then rowPool[i].Visible = false end
+-- ======== Overlay (Billboard) ========
+local function createBillboard(): BillboardGui
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "HorseInfoBB"
+    bb.Size = UDim2.new(0, 260, 0, 60)
+    bb.AlwaysOnTop = true
+    bb.LightInfluence = 0
+    bb.StudsOffset = Vector3.new(0, CONFIG.UI_OFFSET_Y, 0)
+    bb.MaxDistance = 500
+
+    local bg = Instance.new("Frame")
+    bg.Size = UDim2.new(1, 0, 1, 0)
+    bg.BackgroundTransparency = 0.35
+    bg.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
+    bg.BorderSizePixel = 0
+    bg.Parent = bb
+
+    local tl = Instance.new("TextLabel")
+    tl.Name = "Line1"
+    tl.BackgroundTransparency = 1
+    tl.Position = UDim2.new(0, 6, 0, 2)
+    tl.Size = UDim2.new(1, -12, 0, 18)
+    tl.Font = Enum.Font.Code
+    tl.TextSize = CONFIG.TEXT_SIZE
+    tl.TextXAlignment = Enum.TextXAlignment.Left
+    tl.TextColor3 = Color3.fromRGB(235, 255, 235)
+    tl.Text = ""
+    tl.Parent = bg
+
+    local l2 = tl:Clone(); l2.Name = "Line2"; l2.Position = UDim2.new(0,6,0,20); l2.Parent = bg
+    local l3 = tl:Clone(); l3.Name = "Line3"; l3.Position = UDim2.new(0,6,0,38); l3.Parent = bg
+
+    return bb
+end
+
+local function ensureBillboard(m: Model): BillboardGui
+    local existing = m:FindFirstChild("HorseInfoBB")
+    if existing and existing:IsA("BillboardGui") then
+        return existing
+    end
+    local root = hrpOf(m)
+    if not root then
+        error("No root to attach BillboardGui")
+    end
+    local bb = createBillboard()
+    bb.Adornee = root
+    bb.Parent = m
+    return bb
+end
+
+-- ======== Manager ========
+local active = true
+local overlays: {[Model]: BillboardGui} = {}
+local function setOverlayVisible(bb: BillboardGui, vis: boolean)
+    bb.Enabled = vis
+end
+
+local function displayFor(m: Model, origin: Vector3)
+    local root = hrpOf(m); if not root then return end
+    local dist = (root.Position - origin).Magnitude
+    if dist > CONFIG.MAX_RADIUS then
+        local bb = overlays[m]
+        if bb then setOverlayVisible(bb, false) end
+        return
+    end
+
+    local bb = overlays[m] or ensureBillboard(m)
+    overlays[m] = bb
+    setOverlayVisible(bb, true)
+
+    -- data
+    local species = (getAttr(m, CONFIG.ATTR_SPECIES_KEY) :: any)
+    if type(species) ~= "string" then
+        -- guess from name
+        for _, frag in ipairs(CONFIG.NAME_MATCH) do
+            if string.lower(m.Name):find(string.lower(frag)) then
+                species = frag; break
+            end
+        end
+        species = species or "Unknown"
+    end
+
+    local owner = getFirstAttr(m, CONFIG.ATTR_OWNER_KEYS)
+    local wildFlag = getAttr(m, CONFIG.ATTR_WILD_KEY)
+    local tamedFlag = getAttr(m, CONFIG.ATTR_TAMED_KEY)
+    local stateStr = ""
+    if wildFlag ~= nil then
+        stateStr = wildFlag and "Wild" or "Not Wild"
+    elseif tamedFlag ~= nil then
+        stateStr = (tamedFlag == true) and "Tamed" or "Wild"
+    elseif owner ~= nil then
+        stateStr = "Owned"
+    else
+        stateStr = "Wild?"
+    end
+
+    local spd = estimateSpeed(m)
+    local promptStr = nearestPromptInfo(m)
+
+    -- color cue
+    local color = Color3.fromRGB(160, 220, 160) -- default (wild-ish)
+    if owner ~= nil or tamedFlag == true then
+        color = Color3.fromRGB(160, 200, 255)
+    end
+
+    -- write lines
+    local bg = bb:FindFirstChildOfClass("Frame") :: Frame
+    local line1 = bg:FindFirstChild("Line1") :: TextLabel
+    local line2 = bg:FindFirstChild("Line2") :: TextLabel
+    local line3 = bg:FindFirstChild("Line3") :: TextLabel
+
+    line1.TextColor3 = color
+    line1.Text = string.format("%s  —  %s", m.Name, tostring(species))
+    line2.Text = string.format("State: %s   Dist: %.1f   Speed: %.1f", stateStr, dist, spd)
+    line3.Text = string.format("Prompt: %s   Owner: %s", promptStr, owner and tostring(owner) or "n/a")
+end
+
+local function forgetOverlay(m: Model)
+    local bb = overlays[m]
+    if bb then
+        overlays[m] = nil
+        bb:Destroy()
+        lastPos[m] = nil
+        lastTime[m] = nil
     end
 end
 
--- ============== MAIN LOOP ===========
+-- periodic scan
 task.spawn(function()
-    local char = getCharacter()
+    local char = getChar()
     local hrp = hrpOf(char) :: BasePart
 
     while true do
         task.wait(CONFIG.SCAN_INTERVAL)
+        if not active then
+            -- hide all but keep them around
+            for _, bb in pairs(overlays) do bb.Enabled = false end
+            continue
+        end
+
         if not hrp or not hrp.Parent then
-            char = getCharacter()
+            char = getChar()
             hrp = hrpOf(char) :: BasePart
-            if not hrp then continue end
         end
-
         local origin = hrp.Position
-        local horses = nearbyCandidates(origin)
 
-        -- Sort by distance
-        table.sort(horses, function(a, b)
-            local ra = hrpOf(a); local rb = hrpOf(b)
-            if not ra or not rb then return false end
-            return (ra.Position - origin).Magnitude < (rb.Position - origin).Magnitude
-        end)
-
-        local visibleCount = 0
-        for idx, model in ipairs(horses) do
-            if idx > CONFIG.UI_MAX_ROWS then break end
-
-            local root = hrpOf(model)
-            if not root then continue end
-            local dist = (root.Position - origin).Magnitude
-
-            -- line of sight
-            local los = lineOfSight(origin + Vector3.new(0, 3, 0), root.Position + Vector3.new(0, 2, 0), char)
-            if CONFIG.REQUIRE_LINE_OF_SIGHT and not los then
-                -- skip from UI but keep tracking speed
-                estimateSpeed(model)
-                continue
+        -- walk workspace once, filtered
+        local seen: {[Model]: boolean} = {}
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst:IsA("Model") and isHorseLike(inst) then
+                seen[inst] = true
+                displayFor(inst, origin)
             end
-
-            -- estimate speed & color
-            local speed = estimateSpeed(model)
-            local avgColor = averageColor(model)
-
-            -- attributes and prompt
-            local prompt, promptLabel = findPromptOn(model)
-            local keyStr = prompt and tostring(prompt.KeyboardKeyCode):gsub("Enum%.KeyCode%.","") or "n/a"
-
-            local health = readAttr(model, "Health") or readAttr(model, "HP")
-            local maxHealth = readAttr(model, "MaxHealth") or readAttr(model, "MaxHP")
-            local tamed = readAttr(model, "Tamed")
-            local owner = readAttr(model, "Owner") or readAttr(model, "OwnerName")
-
-            local row = getRow(idx)
-            row.Visible = true
-            row.Text = string.format(
-                "[%02d] d=%.1f | v=%.1f | LOS=%s | name=%s | color=%s | prompt=%s[%s]%s%s",
-                idx,
-                dist,
-                speed,
-                los and "yes" or "no",
-                model.Name,
-                formatColor3(avgColor),
-                promptLabel ~= "" and promptLabel or "n/a",
-                keyStr,
-                health and (" | HP="..tostring(health)..(maxHealth and ("/"..tostring(maxHealth)) or "")) or "",
-                tamed ~= nil and (" | Tamed="..tostring(tamed)) or (owner and (" | Owner="..tostring(owner)) or "")
-            )
-
-            -- Also print a more verbose line (once every couple seconds) if close
-            if dist < 40 then
-                print(("[WildHorse] %s | path=%s | d=%.1f | v=%.1f | color=%s | prompt=%s[%s] | HP=%s/%s | Tamed=%s | Owner=%s"):format(
-                    model.Name,
-                    instancePath(model),
-                    dist,
-                    speed,
-                    formatColor3(avgColor),
-                    promptLabel ~= "" and promptLabel or "n/a",
-                    keyStr,
-                    tostring(health or "n/a"),
-                    tostring(maxHealth or "n/a"),
-                    tostring(tamed or "n/a"),
-                    tostring(owner or "n/a")
-                ))
-            end
-
-            visibleCount += 1
         end
 
-        Title.Text = ("Wild Horse Scanner — %d within %dstuds"):format(#horses, CONFIG.SCAN_RADIUS)
-        List.CanvasSize = UDim2.new(0, 0, 0, math.max(0, visibleCount * 24))
-        hideRows(visibleCount + 1)
+        -- cleanup stale
+        for m, _ in pairs(overlays) do
+            if not m.Parent or not seen[m] then
+                forgetOverlay(m)
+            end
+        end
     end
 end)
 
--- ========== OPTIONAL: quick copy of nearest horse info ==========
--- Press O to copy the nearest horse’s summary to the Output (easy to share/debug).
-local UIS = game:GetService("UserInputService")
+-- toggle
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
-    if input.KeyCode == Enum.KeyCode.O then
-        local char = LP.Character
-        local hrp = char and hrpOf(char)
-        if not hrp then return end
-        local origin = hrp.Position
-        local horses = nearbyCandidates(origin)
-        local nearest, nd, nr = nil, math.huge, nil
-        for _, m in ipairs(horses) do
-            local r = hrpOf(m)
-            if r then
-                local d = (r.Position - origin).Magnitude
-                if d < nd then nd, nearest, nr = d, m, r end
-            end
-        end
-        if nearest and nr then
-            local speed = estimateSpeed(nearest)
-            local c = averageColor(nearest)
-            local prompt, label = findPromptOn(nearest)
-            local keyStr = prompt and tostring(prompt.KeyboardKeyCode):gsub("Enum%.KeyCode%.","") or "n/a"
-            print(("-- Nearest Horse --\nName=%s\nPath=%s\nDist=%.1f\nSpeed=%.1f\nColor=%s\nPrompt=%s[%s]")
-                :format(nearest.Name, instancePath(nearest), nd, speed, formatColor3(c), label ~= "" and label or "n/a", keyStr))
-        else
-            print("-- Nearest Horse -- none in range")
-        end
+    if input.KeyCode == Enum.KeyCode.H then
+        active = not active
+        for _, bb in pairs(overlays) do bb.Enabled = active end
+        print(("[HorseOverlay] %s"):format(active and "ON" or "OFF"))
     end
 end)
