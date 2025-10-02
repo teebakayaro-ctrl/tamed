@@ -381,7 +381,14 @@ local function setTameActive(v: boolean)
 	tameToggle.Text = v and "ON" or "OFF"
 	tameToggle.BackgroundColor3 = v and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
 	tameStatus.Text = v and "Seeking nearest horse…" or "Paused."
-	if not v then TARGET, TARGET_ROOT = nil, nil; tameTarget.Text = "Target: n/a" end
+	if not v then 
+        TARGET, TARGET_ROOT = nil, nil; 
+        tameTarget.Text = "Target: n/a";
+        local hrp = myRoot()
+        if hrp then
+            hrp.Anchored = false
+        end
+    end
 end
 tameToggle.MouseButton1Click:Connect(function() setTameActive(not TAME_ACTIVE) end)
 
@@ -424,7 +431,7 @@ task.spawn(function()
 
 		-- Instead of walking, teleport directly onto target
         if TARGET and TARGET_ROOT then
-            local targetPos = TARGET_ROOT.Position + Vector3.new(0, 2, 0) -- slightly above back
+            local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0) -- slightly above back
             -- Use TeleportRemote if available, else client-set CFrame
             if TeleportRemote then
                 pcall(function()
