@@ -1,303 +1,59 @@
 --!strict
--- Lasso Market (Queue Only) — list lassos, choose quantities, no purchase until triggered.
--- UI: draggable, minimizable.  J = show/hide.  Minus key (-) = minimize/restore.
--- To buy later from another script:  if _G.TriggerLassoPurchase then _G.TriggerLassoPurchase() end
+-- Lasso Market (Torn + Western only) with draggable panel & minimize-to-icon
 
-local Players            = game:GetService("Players")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local CollectionService  = game:GetService("CollectionService")
-local UserInputService   = game:GetService("UserInputService")
-local TweenService       = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
 
 local LP = Players.LocalPlayer
 
 -- =========================
--- ====== CONFIG ===========
+-- ====== DATA ============
 -- =========================
-local CFG = {
-    UI_NAME                = "LassoMarketUI",
-    PATTERNS_REMOTE_FN     = { "GetShop", "GetStore", "GetMarket", "ListShop", "ListStore", "GetItems", "GetInventory", "GetLassos", "ShopItems" },
-    PATTERNS_REMOTE_BUY    = { "Buy", "Purchase", "ShopBuy", "StoreBuy", "PurchaseItem" },
-    PATTERNS_MODULE        = { "Shop", "Store", "Market", "Items", "ItemDB", "Catalog" },
-    PATTERNS_FOLDER        = { "Shop", "Store", "Market", "Items", "Catalog" },
-    LASSO_KEYWORDS         = { "lasso" }, -- case-insensitive
-    LASSO_TAGS             = { "Lasso", "Rope", "CaptureTool" }, -- CollectionService tags if the game uses them
-    MAX_ROWS               = 100,
-    PRICE_KEYS             = { "Price", "Cost", "Coins", "Gold", "price", "cost" },
-    ID_KEYS                = { "Id", "ID", "ItemId", "itemId", "Key", "NameKey" },
-    NAME_KEYS              = { "Name", "DisplayName", "Title", "ItemName" },
-    CURRENCY_KEYS          = { "Currency", "currency", "CoinType", "MoneyType" },
-    DRAG_DAMPING           = 0.15,
+type LassoItem = { id: string, name: string, price: number }
+local Catalog: {LassoItem} = {
+    { id = "TornLasso",    name = "TornLasso",    price = 50 },
+    { id = "WesternLasso", name = "WesternLasso", price = 90 },
 }
+local Order: { [string]: number } = {}
+for _, it in ipairs(Catalog) do Order[it.id] = 0 end
 
--- =========================
--- ====== STATE ============
--- =========================
-type LassoItem = { id: string, name: string, price: number?, currency: string?, source: string, raw: any }
-local Catalog: { LassoItem } = {}
-local Order: { [string]: number } = {} -- id -> qty
-local BuyRemote -- (optional) we’ll try to discover one; not used until trigger time
-
--- Expose a trigger other scripts can call later:
+-- trigger stub
 _G.TriggerLassoPurchase = function()
-    -- Don’t actually buy yet; this function will be wired when you’re ready.
-    -- For now it only prints what it *would* buy and tries to call a purchase remote if we can guess it.
-    local total = 0
-    print("[LassoMarket] Trigger received. Queued items:")
-    for _, item in ipairs(Catalog) do
-        local q = Order[item.id]
-        if q and q > 0 then
-            local line = string.format("  - %s x%d%s",
-                item.name,
-                q,
-                item.price and (" @ "..tostring(item.price).." "..(item.currency or "")) or "")
-            print(line)
-            if item.price then total += (item.price * q) end
-        end
-    end
-    print(("[LassoMarket] Total (approx): %s"):format(total > 0 and tostring(total) or "n/a"))
-
-    -- OPTIONAL: attempt a purchase remote if you want it live now.
-    -- Leave commented until you confirm the game’s API.
-    -- if BuyRemote and typeof(BuyRemote) == "Instance" then
-    --     for _, item in ipairs(Catalog) do
-    --         local q = Order[item.id]
-    --         if q and q > 0 then
-    --             local ok, err = pcall(function()
-    --                 if BuyRemote:IsA("RemoteFunction") then
-    --                     return BuyRemote:InvokeServer(item.id, q)
-    --                 elseif BuyRemote:IsA("RemoteEvent") then
-    --                     BuyRemote:FireServer(item.id, q)
-    --                 end
-    --             end)
-    --             print("[LassoMarket] purchase", item.id, q, ok, err)
-    --         end
-    --     end
-    -- end
-end
-
--- =========================
--- ====== UTIL ============
--- =========================
-local function strcontains(hay: string, needle: string): boolean
-    return string.find(string.lower(hay), string.lower(needle), 1, true) ~= nil
-end
-
-local function looksLikeLassoName(s: string): boolean
-    for _, k in ipairs(CFG.LASSO_KEYWORDS) do
-        if strcontains(s, k) then return true end
-    end
-    return false
-end
-
-local function firstField(t: any, keys: {string})
-    if typeof(t) ~= "table" then return nil end
-    for _, k in ipairs(keys) do
-        if t[k] ~= nil then return t[k] end
-        -- allow nested: t.Data.Price
-        local d = t.Data
-        if typeof(d) == "table" and d[k] ~= nil then return d[k] end
-    end
-    return nil
-end
-
-local warnedOnce = false
-local function toItem(x: any, source: string): LassoItem?
-    -- Try to coerce a variety of shapes to our LassoItem
-    if typeof(x) == "Instance" then
-        if not looksLikeLassoName(x.Name) and not CollectionService:HasTag(x, "Lasso") then
-            return nil
-        end
-        local id = tostring(x:GetAttribute("Id") or x:GetAttribute("ID") or x.Name)
-        local price: number? = nil
-        for _, k in ipairs(CFG.PRICE_KEYS) do
-            local v = x:GetAttribute(k)
-            if typeof(v) == "number" then price = v break end
-        end
-        local currency = nil
-        for _, k in ipairs(CFG.CURRENCY_KEYS) do
-            local v = x:GetAttribute(k)
-            if v ~= nil then currency = tostring(v) break end
-        end
-        return { id = id, name = x.Name, price = price, currency = currency, source = source, raw = x }
-    elseif typeof(x) == "table" then
-        local name = firstField(x, CFG.NAME_KEYS) or (typeof(x[1]) == "string" and x[1]) or x.name
-        if not name or not looksLikeLassoName(tostring(name)) then
-            return nil
-        end
-        local id = tostring(firstField(x, CFG.ID_KEYS) or name)
-        local price = firstField(x, CFG.PRICE_KEYS)
-        if price ~= nil then price = tonumber(price) end
-        local currency = firstField(x, CFG.CURRENCY_KEYS)
-        if currency ~= nil then currency = tostring(currency) end
-        return { id = id, name = tostring(name), price = price, currency = currency, source = source, raw = x }
-    else
-        if not warnedOnce then
-            warnedOnce = true
-            warn("[LassoMarket] Unrecognized catalog entry type:", typeof(x))
-        end
-        return nil
-    end
-end
-
--- =========================
--- ====== CATALOG ==========
--- =========================
-local function tryRemoteBuyDiscovery()
-    for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
-        if inst:IsA("RemoteFunction") or inst:IsA("RemoteEvent") then
-            local lname = string.lower(inst.Name)
-            for _, p in ipairs(CFG.PATTERNS_REMOTE_BUY) do
-                if lname:find(string.lower(p)) then
-                    BuyRemote = inst
-                    return
-                end
-            end
-        end
-    end
-end
-
-local function collectFromRemoteFunctions(out: {LassoItem})
-    for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
-        if inst:IsA("RemoteFunction") then
-            local lname = string.lower(inst.Name)
-            local match = false
-            for _, p in ipairs(CFG.PATTERNS_REMOTE_FN) do
-                if lname:find(string.lower(p)) then match = true break end
-            end
-            if not match then continue end
-            local ok, result = pcall(function() return inst:InvokeServer() end)
-            if ok and result then
-                if typeof(result) == "table" then
-                    for k, v in pairs(result) do
-                        local item = toItem(v, "RemoteFunction:" .. inst.Name)
-                        if item then table.insert(out, item) end
-                        -- dictionary form
-                        local asKeyItem = toItem({ Name = tostring(k), Id = tostring(k), Price = (typeof(v) == "number" and v or nil) }, "RemoteFunction:" .. inst.Name)
-                        if asKeyItem and looksLikeLassoName(asKeyItem.name) then table.insert(out, asKeyItem) end
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function collectFromModules(out: {LassoItem})
-    for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
-        if inst:IsA("ModuleScript") then
-            local lname = string.lower(inst.Name)
-            local match = false
-            for _, p in ipairs(CFG.PATTERNS_MODULE) do
-                if lname:find(string.lower(p)) then match = true break end
-            end
-            if not match then continue end
-            local ok, mod = pcall(require, inst)
-            if ok and typeof(mod) == "table" then
-                -- tables may be arrays or dicts; walk both ways
-                for k, v in pairs(mod) do
-                    local item = toItem(v, "Module:" .. inst.Name)
-                    if item then table.insert(out, item) end
-                    -- dictionary fallback
-                    if type(k) == "string" and (type(v) == "number" or type(v) == "table") then
-                        local try = toItem({ Name = k, Id = k, Price = (type(v) == "number" and v or nil) }, "Module:" .. inst.Name)
-                        if try then table.insert(out, try) end
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function collectFromFolders(out: {LassoItem})
-    local function visitFolder(folder: Instance, label: string)
-        for _, d in ipairs(folder:GetDescendants()) do
-            if d:IsA("Folder") or d:IsA("Model") or d:IsA("Configuration") or d:IsA("ValueBase") then
-                -- If this instance *looks* like a lasso item via name/tags/attributes
-                if looksLikeLassoName(d.Name) or CollectionService:HasTag(d, "Lasso") then
-                    local item = toItem(d, "Folder:" .. label)
-                    if item then table.insert(out, item) end
-                else
-                    -- attribute-based type
-                    local typ = d:GetAttribute("Type") or d:GetAttribute("ItemType") or d:GetAttribute("Category")
-                    if typ and tostring(typ):lower():find("lasso") then
-                        local item = toItem(d, "Folder:" .. label)
-                        if item then table.insert(out, item) end
-                    end
-                end
-            end
-        end
-    end
-
-    for _, name in ipairs(CFG.PATTERNS_FOLDER) do
-        local f = ReplicatedStorage:FindFirstChild(name)
-        if f then visitFolder(f, name) end
-    end
-end
-
-local function buildCatalog()
-    local tmp: {LassoItem} = {}
-    collectFromRemoteFunctions(tmp)
-    collectFromModules(tmp)
-    collectFromFolders(tmp)
-
-    -- unique by id+name
-    local seen: {[string]: boolean} = {}
-    Catalog = {}
-    for _, it in ipairs(tmp) do
-        local key = (it.id or it.name) .. "@" .. (it.source or "?")
-        if not seen[key] and looksLikeLassoName(it.name) then
-            seen[key] = true
-            table.insert(Catalog, it)
-        end
-    end
-
-    table.sort(Catalog, function(a, b)
-        local ap = a.price or math.huge
-        local bp = b.price or math.huge
-        if ap == bp then return a.name < b.name end
-        return ap < bp
-    end)
-
-    -- default order quantities to 0
-    Order = {}
+    print("[LassoMarket] Trigger called. Queue:")
     for _, it in ipairs(Catalog) do
-        Order[it.id] = 0
+        local q = Order[it.id]
+        if q > 0 then
+            print(("- %s x%d @ %d = %d"):format(it.name, q, it.price, it.price*q))
+        end
     end
-
-    tryRemoteBuyDiscovery()
 end
 
 -- =========================
--- ====== UI ===============
+-- ====== UI ============
 -- =========================
-local Screen: ScreenGui
-local Panel: Frame
-local List: ScrollingFrame
-local RowTemplate: Frame
-local TotalLabel: TextLabel
-local MinBtn: TextButton
-local CloseBtn: TextButton
-local BuildDone = false
+local PlayerGui = LP:WaitForChild("PlayerGui")
 
-local function makeUI()
-    Screen = Instance.new("ScreenGui")
-    Screen.Name = CFG.UI_NAME
-    Screen.ResetOnSpawn = false
-    Screen.IgnoreGuiInset = true
-    Screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    Screen.Parent = LP:WaitForChild("PlayerGui")
+local Screen = Instance.new("ScreenGui")
+Screen.Name = "LassoMarketUI"
+Screen.ResetOnSpawn = false
+Screen.IgnoreGuiInset = true
+Screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+Screen.Parent = PlayerGui
 
-    Panel = Instance.new("Frame")
-    Panel.Name = "Panel"
-    Panel.Position = UDim2.new(0, 24, 0, 80)
-    Panel.Size = UDim2.new(0, 420, 0, 320)
-    Panel.BackgroundColor3 = Color3.fromRGB(22,22,22)
-    Panel.BackgroundTransparency = 0.1
-    Panel.BorderSizePixel = 0
-    Panel.Active = true
-    Panel.Parent = Screen
+-- main panel
+local Panel = Instance.new("Frame")
+Panel.Name = "Panel"
+Panel.Position = UDim2.new(0, 24, 0, 80)
+Panel.Size = UDim2.new(0, 360, 0, 200)
+Panel.BackgroundColor3 = Color3.fromRGB(22,22,22)
+Panel.BackgroundTransparency = 0.1
+Panel.BorderSizePixel = 0
+Panel.Active = true
+Panel.Parent = Screen
 
-    -- drag
+-- drag
+do
     local dragging, dragStart, startPos = false, nil, nil
     Panel.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
@@ -307,263 +63,178 @@ local function makeUI()
         end
     end)
     Panel.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
-        end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
     end)
-    UserInputService.InputChanged:Connect(function(input)
+    UIS.InputChanged:Connect(function(input)
         if dragging and input.UserInputType == Enum.UserInputType.MouseMovement and dragStart and startPos then
             local delta = input.Position - dragStart
-            local target = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-            Panel.Position = Panel.Position:Lerp(target, CFG.DRAG_DAMPING)
+            Panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
         end
     end)
+end
 
-    local title = Instance.new("TextLabel")
-    title.BackgroundTransparency = 1
-    title.Position = UDim2.new(0, 10, 0, 6)
-    title.Size = UDim2.new(1, -80, 0, 22)
-    title.Font = Enum.Font.Code
-    title.TextSize = 16
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.TextColor3 = Color3.fromRGB(220,255,220)
-    title.Text = "Lasso Market (queue only)"
-    title.Parent = Panel
+-- title
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.new(0, 10, 0, 6)
+title.Size = UDim2.new(1, -40, 0, 20)
+title.Font = Enum.Font.Code
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.fromRGB(220,255,220)
+title.Text = "Lasso Market (queue)"
+title.Parent = Panel
 
-    MinBtn = Instance.new("TextButton")
-    MinBtn.Position = UDim2.new(1, -54, 0, 6)
-    MinBtn.Size = UDim2.new(0, 22, 0, 22)
-    MinBtn.Text = "–"
-    MinBtn.TextScaled = true
-    MinBtn.BackgroundColor3 = Color3.fromRGB(40,40,40)
-    MinBtn.BorderSizePixel = 0
-    MinBtn.Parent = Panel
+-- minimize button
+local MinBtn = Instance.new("TextButton")
+MinBtn.Position = UDim2.new(1, -28, 0, 4)
+MinBtn.Size = UDim2.new(0, 24, 0, 24)
+MinBtn.Text = "–"
+MinBtn.TextScaled = true
+MinBtn.BackgroundColor3 = Color3.fromRGB(40,40,40)
+MinBtn.BorderSizePixel = 0
+MinBtn.Parent = Panel
 
-    CloseBtn = Instance.new("TextButton")
-    CloseBtn.Position = UDim2.new(1, -26, 0, 6)
-    CloseBtn.Size = UDim2.new(0, 22, 0, 22)
-    CloseBtn.Text = "X"
-    CloseBtn.TextScaled = true
-    CloseBtn.BackgroundColor3 = Color3.fromRGB(60,40,40)
-    CloseBtn.BorderSizePixel = 0
-    CloseBtn.Parent = Panel
+-- list area
+local List = Instance.new("Frame")
+List.Name = "List"
+List.Position = UDim2.new(0, 10, 0, 32)
+List.Size = UDim2.new(1, -20, 1, -50)
+List.BackgroundTransparency = 1
+List.Parent = Panel
 
-    List = Instance.new("ScrollingFrame")
-    List.Name = "List"
-    List.Position = UDim2.new(0, 10, 0, 34)
-    List.Size = UDim2.new(1, -20, 1, -74)
-    List.CanvasSize = UDim2.new(0, 0, 0, 0)
-    List.ScrollBarThickness = 6
-    List.BackgroundColor3 = Color3.fromRGB(28,28,28)
-    List.BackgroundTransparency = 0.25
-    List.BorderSizePixel = 0
-    List.Parent = Panel
-
-    RowTemplate = Instance.new("Frame")
-    RowTemplate.Visible = false
-    RowTemplate.Size = UDim2.new(1, -8, 0, 28)
-    RowTemplate.BackgroundTransparency = 1
-    RowTemplate.Parent = List
+-- row template
+local function makeRow(it: LassoItem, y: number)
+    local r = Instance.new("Frame")
+    r.Size = UDim2.new(1, 0, 0, 28)
+    r.Position = UDim2.new(0, 0, 0, y)
+    r.BackgroundTransparency = 1
+    r.Parent = List
 
     local nameL = Instance.new("TextLabel")
-    nameL.Name = "Name"
     nameL.BackgroundTransparency = 1
-    nameL.Position = UDim2.new(0, 0, 0, 4)
-    nameL.Size = UDim2.new(0.55, 0, 1, -8)
+    nameL.Position = UDim2.new(0,0,0,4)
+    nameL.Size = UDim2.new(0.45,0,1,-8)
     nameL.Font = Enum.Font.Code
     nameL.TextSize = 14
-    nameL.TextXAlignment = Enum.TextXAlignment.Left
     nameL.TextColor3 = Color3.fromRGB(235,235,235)
-    nameL.Text = "Name"
-    nameL.Parent = RowTemplate
+    nameL.TextXAlignment = Enum.TextXAlignment.Left
+    nameL.Text = it.name
+    nameL.Parent = r
 
-    local priceL = Instance.new("TextLabel")
-    priceL.Name = "Price"
-    priceL.BackgroundTransparency = 1
-    priceL.Position = UDim2.new(0.55, 0, 0, 4)
-    priceL.Size = UDim2.new(0.18, 0, 1, -8)
-    priceL.Font = Enum.Font.Code
-    priceL.TextSize = 14
-    priceL.TextXAlignment = Enum.TextXAlignment.Left
+    local priceL = nameL:Clone()
+    priceL.Position = UDim2.new(0.45,0,0,4)
+    priceL.Size = UDim2.new(0.15,0,1,-8)
     priceL.TextColor3 = Color3.fromRGB(200,220,255)
-    priceL.Text = "price"
-    priceL.Parent = RowTemplate
+    priceL.Text = tostring(it.price)
+    priceL.Parent = r
 
     local minus = Instance.new("TextButton")
-    minus.Name = "Minus"
-    minus.Position = UDim2.new(0.74, -2, 0, 2)
-    minus.Size = UDim2.new(0, 24, 0, 24)
+    minus.Position = UDim2.new(0.65,0,0,2)
+    minus.Size = UDim2.new(0,24,0,24)
     minus.Text = "–"
     minus.BackgroundColor3 = Color3.fromRGB(50,50,50)
     minus.BorderSizePixel = 0
-    minus.Parent = RowTemplate
+    minus.Parent = r
 
     local qty = Instance.new("TextBox")
-    qty.Name = "Qty"
-    qty.Position = UDim2.new(0.79, 0, 0, 2)
-    qty.Size = UDim2.new(0, 40, 0, 24)
-    qty.Text = "0"
+    qty.Position = UDim2.new(0.75,0,0,2)
+    qty.Size = UDim2.new(0,40,0,24)
+    qty.Text = tostring(Order[it.id])
     qty.ClearTextOnFocus = false
     qty.BackgroundColor3 = Color3.fromRGB(30,30,30)
     qty.TextColor3 = Color3.fromRGB(240,240,240)
     qty.BorderSizePixel = 0
     qty.Font = Enum.Font.Code
     qty.TextSize = 14
-    qty.Parent = RowTemplate
+    qty.Parent = r
 
-    local plus = Instance.new("TextButton")
-    plus.Name = "Plus"
-    plus.Position = UDim2.new(0.89, 2, 0, 2)
-    plus.Size = UDim2.new(0, 24, 0, 24)
+    local plus = minus:Clone()
     plus.Text = "+"
-    plus.BackgroundColor3 = Color3.fromRGB(50,50,50)
-    plus.BorderSizePixel = 0
-    plus.Parent = RowTemplate
+    plus.Position = UDim2.new(0.75,44,0,2)
+    plus.Parent = r
 
-    local src = Instance.new("TextLabel")
-    src.Name = "Src"
-    src.BackgroundTransparency = 1
-    src.Position = UDim2.new(0.94, 0, 0, 4)
-    src.Size = UDim2.new(0.06, -2, 1, -8)
-    src.Font = Enum.Font.Code
-    src.TextSize = 12
-    src.TextXAlignment = Enum.TextXAlignment.Right
-    src.TextColor3 = Color3.fromRGB(150,150,150)
-    src.Text = "S"
-    src.Parent = RowTemplate
+    -- logic
+    local function updateQty(n)
+        if n < 0 then n = 0 end
+        if n > 999 then n = 999 end
+        Order[it.id] = n
+        qty.Text = tostring(n)
+    end
 
-    TotalLabel = Instance.new("TextLabel")
-    TotalLabel.BackgroundTransparency = 1
-    TotalLabel.Position = UDim2.new(0, 10, 1, -34)
-    TotalLabel.Size = UDim2.new(1, -20, 0, 26)
-    TotalLabel.Font = Enum.Font.Code
-    TotalLabel.TextSize = 15
-    TotalLabel.TextXAlignment = Enum.TextXAlignment.Left
-    TotalLabel.TextColor3 = Color3.fromRGB(235,255,235)
-    TotalLabel.Text = "Queued total: n/a"
-    TotalLabel.Parent = Panel
-
-    -- Minimize / close actions
-    MinBtn.MouseButton1Click:Connect(function()
-        local collapsed = Panel.Size.Y.Offset > 40
-        local target = collapsed and UDim2.new(0, 420, 0, 36) or UDim2.new(0, 420, 0, 320)
-        TweenService:Create(Panel, TweenInfo.new(0.15), { Size = target }):Play()
-        List.Visible = not collapsed
-        TotalLabel.Visible = not collapsed
+    minus.MouseButton1Click:Connect(function()
+        updateQty(Order[it.id]-1)
     end)
-    CloseBtn.MouseButton1Click:Connect(function()
-        Screen.Enabled = false
+    plus.MouseButton1Click:Connect(function()
+        updateQty(Order[it.id]+1)
     end)
-
-    BuildDone = true
+    qty.FocusLost:Connect(function()
+        local n = tonumber(qty.Text) or 0
+        updateQty(n)
+    end)
 end
 
-local function setUIVisible(vis: boolean)
-    if not BuildDone then return end
-    Screen.Enabled = vis
+for i,it in ipairs(Catalog) do
+    makeRow(it,(i-1)*30)
 end
 
--- =========================
--- ====== RENDER LIST ======
--- =========================
-local rows: {Frame} = {}
+-- total label
+local Total = Instance.new("TextLabel")
+Total.BackgroundTransparency = 1
+Total.Position = UDim2.new(0, 10, 1, -20)
+Total.Size = UDim2.new(1, -20, 0, 18)
+Total.Font = Enum.Font.Code
+Total.TextSize = 14
+Total.TextColor3 = Color3.fromRGB(235,255,235)
+Total.TextXAlignment = Enum.TextXAlignment.Left
+Total.Text = "Queued total: n/a"
+Total.Parent = Panel
 
-local function clearRows()
-    for _, r in ipairs(rows) do r:Destroy() end
-    rows = {}
-end
-
-local function recalcTotal()
-    local total, cur = 0, nil
-    -- try to keep the first currency we see
-    for _, it in ipairs(Catalog) do
-        local q = Order[it.id]
-        if q and q > 0 and it.price then
-            total += it.price * q
-            cur = cur or it.currency
+-- update total loop
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        local sum = 0
+        for _, it in ipairs(Catalog) do
+            local q = Order[it.id]
+            sum += it.price*q
         end
-    end
-    TotalLabel.Text = string.format("Queued total: %s%s",
-        (cur and (tostring(cur).." ") or ""),
-        (total > 0 and tostring(total) or "n/a"))
-end
-
-local function clampQty(n: number): number
-    if n ~= n then return 0 end -- NaN guard
-    if n < 0 then return 0 end
-    if n > 9999 then return 9999 end
-    return math.floor(n + 0.0001)
-end
-
-local function buildRows()
-    clearRows()
-    local y = 0
-    for i, it in ipairs(Catalog) do
-        if i > CFG.MAX_ROWS then break end
-        local r = RowTemplate:Clone()
-        r.Visible = true
-        r.Position = UDim2.new(0, 4, 0, y)
-        r.Parent = List
-
-        local nameL = r:FindFirstChild("Name") :: TextLabel
-        local priceL = r:FindFirstChild("Price") :: TextLabel
-        local minus = r:FindFirstChild("Minus") :: TextButton
-        local qty = r:FindFirstChild("Qty") :: TextBox
-        local plus = r:FindFirstChild("Plus") :: TextButton
-        local src = r:FindFirstChild("Src") :: TextLabel
-
-        nameL.Text = it.name
-        priceL.Text = it.price and (tostring(it.price) .. (it.currency and (" "..it.currency) or "")) or "n/a"
-        src.Text = string.sub(it.source or "?", 1, 1) -- tiny source hint
-        qty.Text = tostring(Order[it.id] or 0)
-
-        minus.MouseButton1Click:Connect(function()
-            local n = clampQty((Order[it.id] or 0) - 1)
-            Order[it.id] = n; qty.Text = tostring(n); recalcTotal()
-        end)
-        plus.MouseButton1Click:Connect(function()
-            local n = clampQty((Order[it.id] or 0) + 1)
-            Order[it.id] = n; qty.Text = tostring(n); recalcTotal()
-        end)
-        qty.FocusLost:Connect(function(enterPressed)
-            local n = tonumber(qty.Text) or 0
-            n = clampQty(n)
-            Order[it.id] = n
-            qty.Text = tostring(n)
-            recalcTotal()
-        end)
-
-        y += r.Size.Y.Offset
-        table.insert(rows, r)
-    end
-    List.CanvasSize = UDim2.new(0, 0, 0, y)
-    recalcTotal()
-end
-
--- =========================
--- ====== INIT =============
--- =========================
-makeUI()
-buildCatalog()
-buildRows()
-
--- hotkey: J toggles panel
-UserInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.J then
-        setUIVisible(not Screen.Enabled)
-    elseif input.KeyCode == Enum.KeyCode.Minus then
-        -- simulate clicking minimize
-        MinBtn:Activate()
+        Total.Text = "Queued total: "..tostring(sum)
     end
 end)
 
--- Expose lightweight helpers if you want from console:
-_G.LassoMarket = {
-    Catalog = function() return Catalog end,
-    Order   = function() return Order end,
-    Rebuild = function() buildCatalog(); buildRows() end,
-    Show    = function() setUIVisible(true) end,
-    Hide    = function() setUIVisible(false) end,
-}
-print("[LassoMarket] Ready. Press J to open/close. Use +/- or edit quantity. Nothing purchases until you trigger.")
+-- small icon
+local Icon = Instance.new("TextButton")
+Icon.Name = "MiniIcon"
+Icon.Size = UDim2.new(0,40,0,40)
+Icon.Position = UDim2.new(0,24,0,80)
+Icon.Text = "🪢" -- lasso emoji-like
+Icon.Font = Enum.Font.SourceSansBold
+Icon.TextSize = 24
+Icon.BackgroundColor3 = Color3.fromRGB(35,35,35)
+Icon.BorderSizePixel = 0
+Icon.Visible = false
+Icon.Parent = Screen
+
+-- minimize / restore
+MinBtn.MouseButton1Click:Connect(function()
+    Panel.Visible = false
+    Icon.Visible = true
+    Icon.Position = Panel.Position -- dock where panel was
+end)
+Icon.MouseButton1Click:Connect(function()
+    Panel.Visible = true
+    Icon.Visible = false
+end)
+
+-- hotkey J toggle
+UIS.InputBegan:Connect(function(input,gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.J then
+        local v = not Panel.Visible and not Icon.Visible
+        Panel.Visible = v
+        Icon.Visible = not v
+    end
+end)
+
+print("[LassoMarket] ready. J = toggle panel, – = minimize to icon, click 🪢 icon to restore.")
