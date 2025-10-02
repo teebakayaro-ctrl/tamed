@@ -1,41 +1,176 @@
 --!strict
--- Lasso Market (Torn + Western only) — uses ReplicatedStorage.Remotes.PurchaseItemRemote
--- Quantities of 0 are ignored. Click "Buy Now" or call _G.TriggerLassoPurchase()
+-- Tame Flow: Toggleable “Tame Mode” that targets nearest horse, approaches, and interacts.
+-- On success (Tamed/Owner set), it triggers queued lasso purchase via _G.TriggerLassoPurchase().
 
-local Players = game:GetService("Players")
-local UIS = game:GetService("UserInputService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players                 = game:GetService("Players")
+local CollectionService       = game:GetService("CollectionService")
+local ProximityPromptService  = game:GetService("ProximityPromptService")
+local ReplicatedStorage       = game:GetService("ReplicatedStorage")
+local RunService              = game:GetService("RunService")
+local UIS                     = game:GetService("UserInputService")
 
 local LP = Players.LocalPlayer
 
--- ================= DATA =================
-type LassoItem = { id: string, name: string, price: number }
-local Catalog: {LassoItem} = {
-    { id = "TornLasso",    name = "TornLasso",    price = 50 },
-    { id = "WesternLasso", name = "WesternLasso", price = 90 },
+-- =========================
+-- ====== CONFIG ===========
+-- =========================
+local CFG = {
+    SCAN_INTERVAL = 0.25,
+    FOLLOW_RANGE  = 18,       -- we try to stay within this distance
+    REPATH_RANGE  = 45,       -- if we drift beyond this, we try teleport (if available) or speed up
+    SPECIES_ATTR  = "Species",
+    NAME_MATCH = { "Horse","Unicorn","Gargoyle","Equus","Bisorse","Pony","Caprine","Kelpie","Peryton","Fae",
+                   "Plush","Flora","Cybred","Celestial","Saurequine","Hippocampus","Kirin","Cactaline","Clydesdale","Felorse","Akhal","Teke" },
+    TAGS = { "Horse","WildHorse","Mount","Tameable" },
+    UI_POS = UDim2.new(0, 24, 0, 320),
 }
-local Order: { [string]: number } = {}
-for _, it in ipairs(Catalog) do Order[it.id] = 0 end
 
--- ================= UI (small, minimal) =================
+-- =========================
+-- ====== HELPERS ==========
+-- =========================
+local function char() return LP.Character or LP.CharacterAdded:Wait() end
+local function rootOf(m: Model): BasePart?
+    return m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
+end
+local function myRoot(): BasePart?
+    local c = char()
+    return rootOf(c)
+end
+local function isPlayerCharacter(m: Instance): boolean
+    if not m:IsA("Model") then return false end
+    if Players:GetPlayerFromCharacter(m) then return true end
+    if m.Parent and m.Parent.Name == "Characters" then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p.Name == m.Name then return true end
+        end
+    end
+    return false
+end
+local function hasAnyTag(inst: Instance, tags: {string})
+    for _, t in ipairs(tags) do if CollectionService:HasTag(inst, t) then return true end end
+    return false
+end
+local function looksHorseyName(s: string): boolean
+    local low = string.lower(s)
+    for _, frag in ipairs(CFG.NAME_MATCH) do
+        if low:find(string.lower(frag)) then return true end
+    end
+    return false
+end
+local function getAttr(inst: Instance, k: string)
+    local ok, v = pcall(function() return inst:GetAttribute(k) end)
+    return ok and v or nil
+end
+local function isHorseLike(m: Instance): boolean
+    if not m:IsA("Model") then return false end
+    if isPlayerCharacter(m) then return false end
+    if not rootOf(m) then return false end
+    if hasAnyTag(m, CFG.TAGS) then return true end
+    local spec = getAttr(m, CFG.SPECIES_ATTR)
+    if type(spec) == "string" and looksHorseyName(spec) then return true end
+    if looksHorseyName(m.Name) then return true end
+    for _, d in ipairs(m:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local t = string.lower((d.ActionText or "") .. " " .. (d.ObjectText or ""))
+            if t:find("tame") or t:find("mount") or t:find("ride") then return true end
+        end
+    end
+    return false
+end
+
+local function nearestHorse(from: Vector3): (Model?, BasePart?, number)
+    local bestM, bestR, bestD = nil, nil, math.huge
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("Model") and isHorseLike(inst) then
+            local r = rootOf(inst)
+            if r then
+                local d = (r.Position - from).Magnitude
+                if d < bestD then bestD, bestM, bestR = d, inst, r end
+            end
+        end
+    end
+    return bestM, bestR, bestD
+end
+
+local function speciesOf(m: Model): string
+    local s = getAttr(m, CFG.SPECIES_ATTR)
+    if type(s) == "string" and #s > 0 then return s end
+    for _, frag in ipairs(CFG.NAME_MATCH) do
+        if string.lower(m.Name):find(string.lower(frag)) then return frag end
+    end
+    return "Unknown"
+end
+
+local function findTamePrompt(m: Model): ProximityPrompt?
+    for _, d in ipairs(m:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            local t = string.lower((d.ActionText or "") .. " " .. (d.ObjectText or ""))
+            if t:find("tame") or t:find("mount") or t:find("ride") then
+                return d
+            end
+        end
+    end
+    return nil
+end
+
+local successVIM, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
+
+local function tryPress(key: Enum.KeyCode)
+    if successVIM and VIM then
+        VIM:SendKeyEvent(true, key, false, game); task.wait(0.05)
+        VIM:SendKeyEvent(false, key, false, game)
+    end
+end
+
+-- Optional server helpers (best-effort)
+local TeleportRemote: RemoteFunction? = nil
+local GetTamingHorses: RemoteFunction? = nil
+do
+    local rem = ReplicatedStorage:FindFirstChild("Remotes")
+    if rem then
+        local t = rem:FindFirstChild("TeleportRemote")
+        if t and t:IsA("RemoteFunction") then TeleportRemote = t end
+        local g = rem:FindFirstChild("GetTamingHorses")
+        if g and g:IsA("RemoteFunction") then GetTamingHorses = g end
+    end
+end
+
+local function serverTeleportTo(pos: Vector3)
+    if not TeleportRemote then return false end
+    local ok = pcall(function()
+        -- Many games expect a position or a named location; here we try position.
+        TeleportRemote:InvokeServer(pos)
+    end)
+    return ok
+end
+
+-- =========================
+-- ====== UI ===============
+-- =========================
 local gui = Instance.new("ScreenGui")
-gui.Name = "LassoMarketUI"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+gui.Name = "TameFlowUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.Parent = LP:WaitForChild("PlayerGui")
 
 local panel = Instance.new("Frame")
-panel.Size = UDim2.new(0, 380, 0, 210)
-panel.Position = UDim2.new(0, 24, 0, 80)
+panel.Position = CFG.UI_POS
+panel.Size = UDim2.new(0, 280, 0, 88)
 panel.BackgroundColor3 = Color3.fromRGB(22,22,22)
-panel.BackgroundTransparency = 0.08
+panel.BackgroundTransparency = 0.12
 panel.BorderSizePixel = 0
 panel.Active = true
 panel.Parent = gui
 
--- drag
+-- drag panel
 do
     local dragging, start, startPos = false, nil, nil
-    panel.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true; start=i.Position; startPos=panel.Position end end)
+    panel.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            dragging = true; start = i.Position; startPos = panel.Position
+        end
+    end)
     panel.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end end)
     UIS.InputChanged:Connect(function(i)
         if dragging and i.UserInputType==Enum.UserInputType.MouseMovement and start and startPos then
@@ -47,168 +182,159 @@ end
 
 local title = Instance.new("TextLabel")
 title.BackgroundTransparency = 1
-title.Position = UDim2.new(0, 10, 0, 6)
-title.Size = UDim2.new(1, -10, 0, 20)
-title.Font = Enum.Font.Code; title.TextSize = 16
+title.Position = UDim2.new(0,10,0,6)
+title.Size = UDim2.new(1,-20,0,18)
+title.Font = Enum.Font.Code
+title.TextSize = 16
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = Color3.fromRGB(220,255,220)
-title.Text = "Lasso Market"
+title.Text = "Tame Mode"
 title.Parent = panel
 
-local list = Instance.new("Frame")
-list.BackgroundTransparency = 1
-list.Position = UDim2.new(0, 10, 0, 32)
-list.Size = UDim2.new(1, -20, 0, 130)
-list.Parent = panel
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Position = UDim2.new(0,10,0,32)
+toggleBtn.Size = UDim2.new(0, 110, 0, 24)
+toggleBtn.Text = "OFF"
+toggleBtn.Font = Enum.Font.Code
+toggleBtn.TextSize = 14
+toggleBtn.BackgroundColor3 = Color3.fromRGB(90,40,40)
+toggleBtn.BorderSizePixel = 0
+toggleBtn.TextColor3 = Color3.fromRGB(240,240,240)
+toggleBtn.Parent = panel
 
-local function row(it: LassoItem, y: number)
-    local r = Instance.new("Frame")
-    r.Size = UDim2.new(1, 0, 0, 28); r.Position = UDim2.new(0, 0, 0, y)
-    r.BackgroundTransparency = 1; r.Parent = list
-
-    local nameL = Instance.new("TextLabel")
-    nameL.BackgroundTransparency = 1; nameL.Position = UDim2.new(0,0,0,4)
-    nameL.Size = UDim2.new(0.5,0,1,-8); nameL.Font = Enum.Font.Code; nameL.TextSize = 14
-    nameL.TextXAlignment = Enum.TextXAlignment.Left; nameL.TextColor3 = Color3.fromRGB(235,235,235)
-    nameL.Text = it.name; nameL.Parent = r
-
-    local priceL = nameL:Clone()
-    priceL.Position = UDim2.new(0.5,0,0,4)
-    priceL.Size = UDim2.new(0.15,0,1,-8)
-    priceL.TextColor3 = Color3.fromRGB(200,220,255)
-    priceL.Text = tostring(it.price); priceL.Parent = r
-
-    local minus = Instance.new("TextButton")
-    minus.Size = UDim2.new(0,24,0,24); minus.Position = UDim2.new(0.68,0,0,2)
-    minus.Text = "–"; minus.BackgroundColor3 = Color3.fromRGB(50,50,50); minus.BorderSizePixel = 0; minus.Parent = r
-
-    local qty = Instance.new("TextBox")
-    qty.Size = UDim2.new(0,40,0,24); qty.Position = UDim2.new(0.78,0,0,2)
-    qty.Text = tostring(Order[it.id]); qty.ClearTextOnFocus = false
-    qty.BackgroundColor3 = Color3.fromRGB(30,30,30); qty.TextColor3 = Color3.fromRGB(240,240,240)
-    qty.BorderSizePixel = 0; qty.Font = Enum.Font.Code; qty.TextSize = 14; qty.Parent = r
-
-    local plus = minus:Clone(); plus.Text = "+"; plus.Position = UDim2.new(0.78,44,0,2); plus.Parent = r
-
-    local function clamp(n:number) return math.max(0, math.min(999, math.floor((tonumber(n) or 0)+0.0001))) end
-    local function setQty(n:number) n = clamp(n); Order[it.id]=n; qty.Text = tostring(n) end
-    minus.MouseButton1Click:Connect(function() setQty((Order[it.id] or 0)-1) end)
-    plus.MouseButton1Click:Connect(function() setQty((Order[it.id] or 0)+1) end)
-    qty.FocusLost:Connect(function() setQty(qty.Text) end)
-end
-for i,it in ipairs(Catalog) do row(it,(i-1)*30) end
-
-local totalL = Instance.new("TextLabel")
-totalL.BackgroundTransparency = 1
-totalL.Position = UDim2.new(0, 10, 0, 164)
-totalL.Size = UDim2.new(0.6, 0, 0, 20)
-totalL.Font = Enum.Font.Code; totalL.TextSize = 14
-totalL.TextXAlignment = Enum.TextXAlignment.Left
-totalL.TextColor3 = Color3.fromRGB(235,255,235)
-totalL.Text = "Queued total: 0"
-totalL.Parent = panel
-
-local function refreshTotal()
-    local t=0; for _,it in ipairs(Catalog) do t += it.price*(Order[it.id] or 0) end
-    totalL.Text = "Queued total: "..tostring(t)
-end
-task.spawn(function() while task.wait(0.4) do refreshTotal() end end)
+local targetL = Instance.new("TextLabel")
+targetL.BackgroundTransparency = 1
+targetL.Position = UDim2.new(0,130,0,32)
+targetL.Size = UDim2.new(1,-140,0,24)
+targetL.Font = Enum.Font.Code
+targetL.TextSize = 14
+targetL.TextXAlignment = Enum.TextXAlignment.Left
+targetL.TextColor3 = Color3.fromRGB(235,235,235)
+targetL.Text = "Target: n/a"
+targetL.Parent = panel
 
 local statusL = Instance.new("TextLabel")
 statusL.BackgroundTransparency = 1
-statusL.Position = UDim2.new(0, 10, 1, -22)
-statusL.Size = UDim2.new(1, -20, 0, 18)
-statusL.Font = Enum.Font.Code; statusL.TextSize = 13
+statusL.Position = UDim2.new(0,10,0,58)
+statusL.Size = UDim2.new(1,-20,0,22)
+statusL.Font = Enum.Font.Code
+statusL.TextSize = 13
 statusL.TextXAlignment = Enum.TextXAlignment.Left
 statusL.TextColor3 = Color3.fromRGB(200,200,200)
-statusL.Text = "Ready."; statusL.Parent = panel
+statusL.Text = "Ready."
+statusL.Parent = panel
 
-local buyBtn = Instance.new("TextButton")
-buyBtn.Position = UDim2.new(1, -110, 0, 160)
-buyBtn.Size = UDim2.new(0, 100, 0, 26)
-buyBtn.Text = "Buy Now"
-buyBtn.Font = Enum.Font.Code; buyBtn.TextSize = 14
-buyBtn.BackgroundColor3 = Color3.fromRGB(40,80,40)
-buyBtn.TextColor3 = Color3.fromRGB(240,240,240)
-buyBtn.BorderSizePixel = 0
-buyBtn.Parent = panel
+local active = false
+local currentTarget: Model? = nil
+local currentRoot: BasePart? = nil
 
--- minimize → tiny icon
-local icon = Instance.new("TextButton")
-icon.Size = UDim2.new(0,40,0,40); icon.Position = panel.Position
-icon.Text = "🪢"; icon.Font = Enum.Font.SourceSansBold; icon.TextSize = 24
-icon.BackgroundColor3 = Color3.fromRGB(35,35,35); icon.BorderSizePixel = 0
-icon.Visible = false; icon.Parent = gui
-local function minimize() icon.Position = panel.Position; panel.Visible=false; icon.Visible=true end
-local function restore() panel.Visible=true; icon.Visible=false end
-local minBtn = Instance.new("TextButton")
-minBtn.Size = UDim2.new(0,24,0,24); minBtn.Position = UDim2.new(1,-28,0,4)
-minBtn.Text="–"; minBtn.TextScaled=true; minBtn.BackgroundColor3=Color3.fromRGB(40,40,40); minBtn.BorderSizePixel=0; minBtn.Parent = panel
-minBtn.MouseButton1Click:Connect(minimize)
-icon.MouseButton1Click:Connect(restore)
-UIS.InputBegan:Connect(function(i,g) if not g and i.KeyCode==Enum.KeyCode.J then if panel.Visible then minimize() else restore() end end end)
-
--- ============== PURCHASE ENGINE (specific remote) ==============
-local PurchaseItemRemote: RemoteFunction? = nil
-do
-    local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-    if remotes then
-        local r = remotes:FindFirstChild("PurchaseItemRemote")
-        if r and r:IsA("RemoteFunction") then PurchaseItemRemote = r end
-    end
+local function setActive(v: boolean)
+    active = v
+    toggleBtn.Text = v and "ON" or "OFF"
+    toggleBtn.BackgroundColor3 = v and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
+    statusL.Text = v and "Seeking nearest horse…" or "Paused."
 end
 
-local function setStatus(t: string) statusL.Text = t; print("[LassoMarket]", t) end
+toggleBtn.MouseButton1Click:Connect(function() setActive(not active) end)
 
--- Try common argument shapes until one succeeds.
-local function callPurchase(itemId: string, qty: number): (boolean, any)
-    if not PurchaseItemRemote then
-        setStatus("PurchaseItemRemote not found at ReplicatedStorage.Remotes.PurchaseItemRemote")
-        return false, "no-remote"
-    end
-    -- Skip qty 0 — do nothing.
-    if qty <= 0 then return true, "skipped" end
+-- =========================
+-- ====== MAIN LOOP ========
+-- =========================
+task.spawn(function()
+    local myH = char():WaitForChild("Humanoid") :: Humanoid
+    myH.AutoRotate = true
+    myH.WalkSpeed = 16
 
-    local variants = {
-        function() return itemId, qty end,                                           -- (id, qty)
-        function() return {itemId=itemId, quantity=qty} end,                         -- { itemId=, quantity= }
-        function() return {Id=itemId, Qty=qty} end,                                  -- { Id=, Qty= }
-        function() return {name=itemId, count=qty} end,                              -- { name=, count= }
-        function() return itemId end,                                                -- (id) once
-    }
-    for idx, build in ipairs(variants) do
-        local a, b = build()
-        local ok, res = pcall(function()
-            return (PurchaseItemRemote :: RemoteFunction):InvokeServer(a, b)
-        end)
-        if ok then
-            return true, res
+    while true do
+        task.wait(CFG.SCAN_INTERVAL)
+        local hrp = myRoot()
+        if not hrp then continue end
+
+        if not active then
+            currentTarget = nil; currentRoot = nil
+            targetL.Text = "Target: n/a"
+            continue
         end
-    end
-    return false, "all-variants-failed"
-end
 
-local function buyQueued()
-    -- nothing to buy?
-    local something=false
-    for _,it in ipairs(Catalog) do if (Order[it.id] or 0) > 0 then something=true break end end
-    if not something then setStatus("Nothing to buy (all quantities are 0)."); return end
-
-    for _, it in ipairs(Catalog) do
-        local q = Order[it.id] or 0
-        if q > 0 then
-            setStatus(("Buying %s x%d..."):format(it.name, q))
-            local ok, res = callPurchase(it.id, q)
-            if ok then
-                setStatus(("OK: %s x%d (server: %s)"):format(it.name, q, tostring(res)))
+        -- If no target, pick the nearest (or use GetTamingHorses list if present)
+        if (not currentTarget) or (not currentTarget.Parent) then
+            local target, tRoot, dist = nil, nil, math.huge
+            if GetTamingHorses then
+                local ok, list = pcall(function() return GetTamingHorses:InvokeServer() end)
+                if ok and typeof(list) == "table" then
+                    for _, m in ipairs(list) do
+                        if typeof(m) == "Instance" and m:IsA("Model") and isHorseLike(m) then
+                            local r = rootOf(m)
+                            if r then
+                                local d = (r.Position - hrp.Position).Magnitude
+                                if d < dist then dist, target, tRoot = d, m, r end
+                            end
+                        end
+                    end
+                end
+            end
+            if not target then
+                target, tRoot, dist = nearestHorse(hrp.Position)
+            end
+            currentTarget, currentRoot = target, tRoot
+            if target and tRoot then
+                targetL.Text = string.format("Target: %s (%.1f)", speciesOf(target), (tRoot.Position - hrp.Position).Magnitude)
+                statusL.Text = "Target acquired."
             else
-                setStatus(("Failed: %s x%d"):format(it.name, q))
+                targetL.Text = "Target: n/a"
+                statusL.Text = "No horse found nearby."
+            end
+        end
+
+        if currentTarget and currentRoot and currentTarget.Parent then
+            -- approach / follow
+            local dist = (currentRoot.Position - hrp.Position).Magnitude
+
+            -- If very far and we have TeleportRemote, try a one-time jump near it
+            if dist > CFG.REPATH_RANGE and TeleportRemote then
+                statusL.Text = "Far away. Teleporting near target…"
+                -- offset a bit below/aside to avoid overlap; server may clamp
+                local targetPos = currentRoot.Position + Vector3.new(0, 0, -4)
+                pcall(function() serverTeleportTo(targetPos) end)
+            end
+
+            -- Move closer until within FOLLOW_RANGE
+            if dist > CFG.FOLLOW_RANGE then
+                local dir = (currentRoot.Position - hrp.Position); dir = Vector3.new(dir.X, 0, dir.Z)
+                if dir.Magnitude > 1e-2 then
+                    myH:Move(dir.Unit)
+                end
+            else
+                myH:Move(Vector3.new(0,0,0))
+            end
+
+            -- face target for prompts
+            hrp.CFrame = CFrame.new(hrp.Position, Vector3.new(currentRoot.Position.X, hrp.Position.Y, currentRoot.Position.Z))
+
+            -- Try to interact with a Tame/Mount prompt if in range
+            local prompt = findTamePrompt(currentTarget)
+            if prompt and prompt.Enabled then
+                local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
+                tryPress(key)
+                statusL.Text = "Interacting with prompt…"
+            end
+
+            -- Check success: Tamed or Owner set to us
+            local tamed = getAttr(currentTarget, "Tamed")
+            local owner = getAttr(currentTarget, "Owner") or getAttr(currentTarget, "OwnerName")
+            if tamed == true or owner == LP.Name then
+                statusL.Text = "Tame success! Triggering queued purchases…"
+                -- fire your queued purchase now
+                if _G.TriggerLassoPurchase then
+                    _G.TriggerLassoPurchase()
+                end
+                -- stop the loop & clear target
+                setActive(false)
+                currentTarget, currentRoot = nil, nil
+            else
+                -- keep UI updated
+                targetL.Text = string.format("Target: %s (%.1f)", speciesOf(currentTarget), dist)
             end
         end
     end
-end
-
-buyBtn.MouseButton1Click:Connect(buyQueued)
-
--- also expose a programmatic trigger for your “after tame” step
-_G.TriggerLassoPurchase = function() buyQueued() end
+end)
