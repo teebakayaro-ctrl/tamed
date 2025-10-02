@@ -1,6 +1,3 @@
 -- SafeTameSpy.client.lua
-local RS = game:GetService("ReplicatedStorage")
-local StarterPlayer = game:GetService("StarterPlayer")
-local StarterGui = game:GetService("StarterGui")
 
 print("[SafeTameSpy] Ready. Do a normal tame and watch the console.")
