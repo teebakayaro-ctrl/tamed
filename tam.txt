@@ -739,17 +739,7 @@ task.spawn(function()
 		if not okEquip then
 			tameStatus.Text = "No lasso yet—trying to purchase/equip…"
 		end
-
-        local ok = _G.EnsureMountedOn(TARGET, true)
-        if ok then
-            print("[Logic] Mounted")
-            tameStatus.Text = "Seated !!"
-            -- proceed to your taming click/logic
-        else
-            print("[Logic] Not Mounted find ur horse and mount")
-            tameStatus.Text = "Not seated find ur horse"
-            -- could not mount; you can retry or pick a new target
-        end
+      
 		-- acquire target if needed
 		if (not TARGET) or (not TARGET.Parent) then
 			local t, tR = nearestHorse(hrp.Position)
@@ -763,53 +753,61 @@ task.spawn(function()
 			end
 		end
 
-		-- 3) teleport directly under target and anchor self
-		if TARGET and TARGET_ROOT then
-			local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0)
-			if TeleportRemote then
-				pcall(function() TeleportRemote:InvokeServer(targetPos) end)
-			else
-				if hrp then hrp.CFrame = CFrame.new(targetPos) end
-			end
-			if hrp then hrp.Anchored = true end
+        local ok = _G.EnsureMountedOn(TARGET, true)
+        if ok then
+            -- 3) teleport directly under target and anchor self
+            if TARGET and TARGET_ROOT then
+                local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0)
+                if TeleportRemote then
+                    pcall(function() TeleportRemote:InvokeServer(targetPos) end)
+                else
+                    if hrp then hrp.CFrame = CFrame.new(targetPos) end
+                end
+                if hrp then hrp.Anchored = true end
 
-			-- 4) attempt to tame
-			-- try prompt first
-			local prompt = findTamePrompt(TARGET)
-			if prompt and prompt.Enabled then
-				local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
-				tapKey(key)
-				tameStatus.Text = "Trying to mount/tame via prompt…"
-			else
-				-- fall back to right-clicking the horse root/center
-				if os.clock() - LAST_CLICK_T > 0.25 then
-					rightClickWorldPos(TARGET_ROOT.Position)
-					LAST_CLICK_T = os.clock()
-					tameStatus.Text = "Right-clicking target to tame…"
-				end
-			end
+                -- 4) attempt to tame
+                -- try prompt first
+                local prompt = findTamePrompt(TARGET)
+                if prompt and prompt.Enabled then
+                    local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
+                    tapKey(key)
+                    tameStatus.Text = "Trying to mount/tame via prompt…"
+                else
+                    -- fall back to right-clicking the horse root/center
+                    if os.clock() - LAST_CLICK_T > 0.25 then
+                        rightClickWorldPos(TARGET_ROOT.Position)
+                        LAST_CLICK_T = os.clock()
+                        tameStatus.Text = "Right-clicking target to tame…"
+                    end
+                end
 
-			-- lightweight "tamed?" heuristic: if prompt disappears or horse loses Tame/Mount prompts for >1s
-			local t0 = os.clock()
-			local tamedNow = false
-			for _ = 1, 8 do
-				task.wait(0.125)
-				local p2 = findTamePrompt(TARGET)
-				if (not p2) or (p2 and not p2.Enabled) then
-					tamedNow = true; break
-				end
-			end
-			if tamedNow then
-				logTameEvent("tamed", { dt = os.clock() - t0 })
-				tameStatus.Text = "Tamed! (logged)"
-				-- keep anchored a bit so the popup can appear (step 5 will read _G.TameLog)
-				task.delay(0.6, function()
-					local me = myRoot()
-					if me then me.Anchored = false end
-				end)
-				-- release current target so the loop can choose a new one next tick
-				TARGET, TARGET_ROOT = nil, nil
-			end
-		end
+                -- lightweight "tamed?" heuristic: if prompt disappears or horse loses Tame/Mount prompts for >1s
+                local t0 = os.clock()
+                local tamedNow = false
+                for _ = 1, 8 do
+                    task.wait(0.125)
+                    local p2 = findTamePrompt(TARGET)
+                    if (not p2) or (p2 and not p2.Enabled) then
+                        tamedNow = true; break
+                    end
+                end
+                if tamedNow then
+                    logTameEvent("tamed", { dt = os.clock() - t0 })
+                    tameStatus.Text = "Tamed! (logged)"
+                    -- keep anchored a bit so the popup can appear (step 5 will read _G.TameLog)
+                    task.delay(0.6, function()
+                        local me = myRoot()
+                        if me then me.Anchored = false end
+                    end)
+                    -- release current target so the loop can choose a new one next tick
+                    TARGET, TARGET_ROOT = nil, nil
+                end
+            end
+        else
+            print("[Logic] Not Mounted find ur horse and mount")
+            tameStatus.Text = "Not seated find ur horse"
+            -- could not mount; you can retry or pick a new target
+        end
+		
 	end
 end)
