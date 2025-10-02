@@ -66,10 +66,6 @@ local function scan(root)
   end)
 end
 
-scan(RS)
-scan(StarterPlayer)
-scan(StarterGui)
-scan(RS:FindFirstChild("_replicationFolder"))
 
 -- ---------- optional client->server logging (only if allowed) ----------
 do
