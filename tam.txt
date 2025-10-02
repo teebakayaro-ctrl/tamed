@@ -369,6 +369,232 @@ end
 buyBtn.MouseButton1Click:Connect(buyQueued)
 _G.TriggerLassoPurchase = function() buyQueued() end
 
+-- ========= Mount / Ride Helpers =========
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local VIM = game:GetService("VirtualInputManager")
+local PPS = game:GetService("ProximityPromptService")
+
+local LP = Players.LocalPlayer
+local function Char() return LP.Character or LP.CharacterAdded:Wait() end
+local function Hum() return Char():WaitForChild("Humanoid") end
+local function Root() return Char():WaitForChild("HumanoidRootPart") end
+
+local MOUNT_PROMPT_KEYFALLBACK = Enum.KeyCode.E
+local RIGHT_MOUSE_BUTTON = 1 -- for VIM SendMouseButtonEvent
+
+local function isMounted()
+	local hum = Hum()
+	if hum.SeatPart and hum.Sit then return true end
+	-- some games weld to a saddle (no SeatPart); add a mild heuristic:
+	local weld = Char():FindFirstChildOfClass("Weld") or Char():FindFirstChildOfClass("WeldConstraint")
+	if weld and weld.Part1 and weld.Part1:IsDescendantOf(workspace) and weld.Part1.Parent and weld.Part1.Parent:FindFirstChild("HorseTag") then
+		return true
+	end
+	return false
+end
+
+local function findSeat(horse: Instance)
+	if not horse then return nil end
+	-- Deep search: Seat, VehicleSeat, or a Part named like "Seat"/"Saddle"
+	local seat = horse:FindFirstChildWhichIsA("Seat", true) or horse:FindFirstChildWhichIsA("VehicleSeat", true)
+	if seat then return seat end
+	for _, d in ipairs(horse:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local n = string.lower(d.Name)
+			if n:find("seat") or n:find("saddle") then
+				return d -- some systems mount to a plain part via weld
+			end
+		end
+	end
+	return nil
+end
+
+local function findMountPrompt(horse: Instance)
+	if not horse then return nil end
+	local candidates = {}
+	for _, d in ipairs(horse:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			local n = string.lower(d.Name)
+			local at = string.lower(d.ActionText or "")
+			local obj = string.lower(d.ObjectText or "")
+			if n:find("ride") or n:find("mount") or n:find("sit")
+				or at:find("ride") or at:find("mount") or at:find("sit")
+				or obj:find("saddle") or obj:find("horse")
+			then
+				table.insert(candidates, d)
+			end
+		end
+	end
+	-- prefer enabled & shortest MaxActivationDistance
+	table.sort(candidates, function(a,b)
+		local ae = a.Enabled and 1 or 0
+		local be = b.Enabled and 1 or 0
+		if ae ~= be then return ae > be end
+		return (a.MaxActivationDistance or 10) < (b.MaxActivationDistance or 10)
+	end)
+	return candidates[1]
+end
+
+local function screenClickWorld(worldPos: Vector3, button: number?)
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local vp, onScreen = cam:WorldToViewportPoint(worldPos)
+	local x = vp.X; local y = vp.Y
+	if not onScreen then x, y = cam.ViewportSize.X/2, cam.ViewportSize.Y/2 end
+	VIM:SendMouseMoveEvent(x, y, game)
+	task.wait(0.02)
+	VIM:SendMouseButtonEvent(x, y, button or RIGHT_MOUSE_BUTTON, true, game, 0)
+	task.wait(0.03)
+	VIM:SendMouseButtonEvent(x, y, button or RIGHT_MOUSE_BUTTON, false, game, 0)
+end
+
+local function pressKey(key: Enum.KeyCode)
+	VIM:SendKeyEvent(true, key, false, game)
+	task.wait(0.04)
+	VIM:SendKeyEvent(false, key, false, game)
+end
+
+-- Try to activate a ProximityPrompt by simulating “look at & press key”.
+local function tryMountViaPrompt(horse: Instance, keyOverride: Enum.KeyCode?)
+	local prompt = findMountPrompt(horse)
+	if not prompt or not prompt.Enabled then return false, "no_prompt" end
+
+	-- move close enough + face it
+	local hrp = Root()
+	local targetPart = prompt.Parent:IsA("BasePart") and prompt.Parent or horse:FindFirstChildWhichIsA("BasePart", true)
+	if targetPart then
+		local p = targetPart.Position + Vector3.new(0, 2.2, 0)
+		pcall(function()
+			if hrp then hrp.CFrame = CFrame.new(p, targetPart.Position) end
+		end)
+		task.wait(0.05)
+		-- click around it (some games require right click to “focus”)
+		screenClickWorld(targetPart.Position, 0) -- left
+	end
+
+	local key = keyOverride or prompt.KeyboardKeyCode or MOUNT_PROMPT_KEYFALLBACK
+	pressKey(key)
+
+	-- wait briefly to see if seated
+	for _ = 1, 20 do
+		task.wait(0.05)
+		if isMounted() then return true end
+	end
+	return false, "prompt_failed"
+end
+
+-- Try to mount using a Seat or “seat-like” part.
+local function tryMountViaSeat(horse: Instance)
+	local seat = findSeat(horse)
+	if not seat then return false, "no_seat" end
+
+	local hum = Hum()
+	-- If it’s a real Seat/VehicleSeat → Sit
+	if seat.ClassName == "Seat" or seat.ClassName == "VehicleSeat" then
+		pcall(function() seat:Sit(hum) end)
+	else
+		-- fallback: weld to “saddle” part (some systems do this server-side; this local weld is best-effort)
+		local hrp = Root()
+		if hrp and seat:IsA("BasePart") then
+			hrp.CFrame = seat.CFrame + Vector3.new(0, 1.75, 0)
+		end
+	end
+
+	for _ = 1, 20 do
+		task.wait(0.05)
+		if isMounted() then return true end
+	end
+	return false, "seat_failed"
+end
+
+-- Try to find and call a remote that mounts the player onto the horse.
+local function tryMountViaRemote(horse: Instance)
+	local remFolders = {
+		RS, RS:FindFirstChild("Remotes"), RS:FindFirstChild("RemoteEvents"),
+		RS:FindFirstChild("RemoteFunctions"),
+	}
+	local nameHints = { "Mount", "Ride", "Sit", "MountHorse", "RideHorse", "GetOn", "Saddle" }
+
+	local function looksLikeMountName(n: string)
+		n = string.lower(n)
+		for _, h in ipairs(nameHints) do
+			if n:find(string.lower(h)) then return true end
+		end
+		return false
+	end
+
+	local found = {}
+	for _, folder in ipairs(remFolders) do
+		if folder and folder:IsA("Instance") then
+			for _, d in ipairs(folder:GetDescendants()) do
+				if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) and looksLikeMountName(d.Name) then
+					table.insert(found, d)
+				end
+			end
+		end
+	end
+
+	for _, r in ipairs(found) do
+		local ok, err
+		if r:IsA("RemoteEvent") then
+			ok = pcall(function() r:FireServer(horse) end)
+		else
+			ok, err = pcall(function() r:InvokeServer(horse) end)
+		end
+		if ok then
+			for _ = 1, 20 do
+				task.wait(0.05)
+				if isMounted() then return true end
+			end
+		end
+	end
+
+	return false, "no_remote_or_failed"
+end
+
+-- Public: call this with your target horse model
+_G.MountHorse = function(horse: Instance)
+	if not horse then return false, "no_target" end
+
+	-- 1) Seat path
+	local ok, why = tryMountViaSeat(horse)
+	if ok then return true end
+
+	-- 2) Prompt path
+	ok, why = tryMountViaPrompt(horse)
+	if ok then return true end
+
+	-- 3) Remote path
+	ok, why = tryMountViaRemote(horse)
+	if ok then return true end
+
+	return false, why or "mount_failed"
+end
+
+-- Utility to ensure mounted (will attempt multiple methods and re-teleport under target)
+_G.EnsureMountedOn = function(horse: Instance, teleportUnder: boolean?)
+	local tries = 0
+	while not isMounted() and tries < 4 do
+		tries += 1
+		if teleportUnder and horse and horse:IsDescendantOf(workspace) then
+			local root = horse:FindFirstChild("HumanoidRootPart") or horse:FindFirstChildWhichIsA("BasePart", true)
+			if root then
+				pcall(function()
+					Root().CFrame = CFrame.new(root.Position + Vector3.new(0, -10, 0))
+				end)
+				task.wait(0.05)
+			end
+		end
+		local ok = _G.MountHorse(horse)
+		if ok then return true end
+		task.wait(0.15)
+	end
+	return isMounted()
+end
+-- ========= End Mount / Ride Helpers =========
+
 -- ===================== Tame Logic =====================
 
 -- inventory helpers (equip a lasso if we have one; otherwise buy one, then equip)
@@ -514,6 +740,16 @@ task.spawn(function()
 			tameStatus.Text = "No lasso yet—trying to purchase/equip…"
 		end
 
+        local ok = _G.EnsureMountedOn(TARGET, true)
+        if ok then
+            print("[Logic] Mounted")
+            tameStatus.Text = "Seated !!"
+            -- proceed to your taming click/logic
+        else
+            print("[Logic] Not Mounted find ur horse and mount")
+            tameStatus.Text = "Not seated find ur horse"
+            -- could not mount; you can retry or pick a new target
+        end
 		-- acquire target if needed
 		if (not TARGET) or (not TARGET.Parent) then
 			local t, tR = nearestHorse(hrp.Position)
