@@ -89,43 +89,4 @@ do
   end
 end
 
--- ---------- SAFE wrap of _replicationFolder.Lasso (if a ModuleScript) ----------
-local function safeWrap(modTbl, fnName)
-  local original = modTbl[fnName]
-  print(("[Lasso] %s exists? %s (%s)"):format(fnName, original~=nil, typeof(original)))
-  if type(original) ~= "function" then return end
-  modTbl[fnName] = function(...)
-    local args = {...}
-    print(("\n[Lasso] %s called with:"):format(fnName))
-    dumpArgs(args)
-    -- call original safely
-    local ok, a,b,c,d,e = pcall(original, table.unpack(args))
-    if not ok then warn("[Lasso] "..fnName.." error:", a) return end
-    return a,b,c,d,e
-  end
-end
-
-do
-  local rf = RS:FindFirstChild("_replicationFolder")
-  if rf then
-    local lassoModule = rf:FindFirstChild("Lasso")
-    if lassoModule and lassoModule:IsA("ModuleScript") then
-      local ok, tbl = pcall(require, lassoModule)
-      if ok and type(tbl)=="table" then
-        print("[Lasso] Module required. Trying to wrap candidate functions…")
-        -- ONLY wrap if real functions; otherwise just report their type
-        safeWrap(tbl, "doLasso")
-        safeWrap(tbl, "_hit")
-        safeWrap(tbl, "throw")
-        safeWrap(tbl, "attach")
-        safeWrap(tbl, "release")
-      else
-        print("[Lasso] require() returned:", typeof(tbl))
-      end
-    else
-      print("[Lasso] Not a ModuleScript (or missing). Skipping function wrap.")
-    end
-  end
-end
-
 print("[SafeTameSpy] Ready. Do a normal tame and watch the console.")
