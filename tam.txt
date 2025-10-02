@@ -513,155 +513,101 @@ _G.EnsureRideSnapshot = function()
 	return _G.SeatSpoof_Start()
 end
 -- =========================================================
--- ===================== Rider Freeze (fly-under but "riding") =====================
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LP = Players.LocalPlayer
-local function Char() return LP.Character or LP.CharacterAdded:Wait() end
-local function Hum() return Char():WaitForChild("Humanoid") end
-local function Root() return Char():WaitForChild("HumanoidRootPart") end
+-- ---- Target click helpers ----
+local RS = game:GetService("ReplicatedStorage")
 
--- --- internals
-local _followConn: RBXScriptConnection?
-local _seatConn: RBXScriptConnection?
-local _ghostSeat: Seat?
-local _savedStateEnabled: {[Enum.HumanoidStateType]: boolean} = {}
-local _frozen = false
-
-local function _createGhostSeat()
-	if _ghostSeat then return _ghostSeat end
-	local seat = Instance.new("Seat")
-	seat.Name = "GhostSeat_Local"
-	seat.Anchored = true
-	seat.Transparency = 1
-	seat.CanCollide = false
-	seat.Size = Vector3.new(2, 0.6, 2)
-	seat.Parent = workspace
-	_ghostSeat = seat
-	return seat
-end
-
-local function _setCollide(char, on)
-	for _, p in ipairs(char:GetDescendants()) do
-		if p:IsA("BasePart") then p.CanCollide = on end
-	end
-end
-
-local function _lockToSeated(hum)
-	-- remember current state-enabled table once
-	if next(_savedStateEnabled) == nil then
-		for _, s in ipairs(Enum.HumanoidStateType:GetEnumItems()) do
-			_savedStateEnabled[s] = hum:GetStateEnabled(s)
+-- Find a good clickable BasePart on the horse
+local function getTargetPart(horse: Instance): BasePart?
+	if not horse then return nil end
+	-- prefer HRP / Seat / saddle-like parts
+	local hrp = horse:FindFirstChild("HumanoidRootPart")
+	if hrp and hrp:IsA("BasePart") then return hrp end
+	local seat = horse:FindFirstChildWhichIsA("Seat", true)
+	if seat then return seat end
+	-- otherwise any part near the center
+	local best, bestDist = nil, math.huge
+	for _, d in ipairs(horse:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local c = d.Position.Magnitude
+			if c < bestDist then best, bestDist = d, c end
 		end
 	end
-	-- disable all, allow only Seated
-	for _, s in ipairs(Enum.HumanoidStateType:GetEnumItems()) do
-		hum:SetStateEnabled(s, s == Enum.HumanoidStateType.Seated)
-	end
-	hum:ChangeState(Enum.HumanoidStateType.Seated)
+	return best
 end
 
-local function _restoreStates(hum)
-	if next(_savedStateEnabled) ~= nil then
-		for s, en in pairs(_savedStateEnabled) do
-			-- some enums may be deprecated; guard pcall
-			pcall(function() hum:SetStateEnabled(s, en) end)
+local KNOWN_TAME_REMOTE_NAMES = {
+	"TameHorse","Tame","RightClickHorse","ClickHorse","UseLasso","LassoTame",
+	"MountOrTame","InteractHorse","Interact"
+}
+
+local function findTameRemote()
+	-- search a few common folders
+	local buckets = { RS, RS:FindFirstChild("Remotes"), RS:FindFirstChild("RemoteEvents"), RS:FindFirstChild("RemoteFunctions") }
+	for _, folder in ipairs(buckets) do
+		if folder then
+			for _, d in ipairs(folder:GetDescendants()) do
+				if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction")) then
+					local n = d.Name:lower()
+					for _, k in ipairs(KNOWN_TAME_REMOTE_NAMES) do
+						if n:find(k:lower()) then return d end
+					end
+				end
+			end
 		end
 	end
+	return nil
 end
 
-local function _sitOnGhostSeat()
-	local hum = Hum()
-	local hrp = Root()
-	local seat = _createGhostSeat()
+-- Preferred click path:
+-- 1) ClickDetector on any useful part
+-- 2) ProximityPrompt on horse
+-- 3) Known RemoteEvent/Function with horse as arg
+-- 4) Fallback to world click (your old method)
+local function clickOnTarget(horse: Model): boolean
+	if not (horse and horse.Parent) then return false end
+	local part = getTargetPart(horse); if not part then return false end
 
-	-- keep seat glued under HRP a little bit (so Sit works even while moving)
-	if _seatConn then _seatConn:Disconnect(); _seatConn = nil end
-	_seatConn = RunService.Heartbeat:Connect(function()
-		if not _ghostSeat or not hrp then return end
-		_ghostSeat.CFrame = hrp.CFrame * CFrame.new(0, -1.5, 0)
-	end)
+	-- (1) ClickDetector
+	local function findCD(inst: Instance): ClickDetector?
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("ClickDetector") then return d end
+		end
+		return nil
+	end
+	local cd = findCD(horse) or findCD(part)
+	if cd then
+		pcall(fireclickdetector, cd)
+		return true
+	end
 
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-	seat:Sit(hum)
-
-	-- wait until we have the trio
-	for _ = 1, 30 do
-		RunService.Heartbeat:Wait()
-		if hum.Sit and hum.SeatPart == seat and hum:GetState() == Enum.HumanoidStateType.Seated then
+	-- (2) ProximityPrompt
+	for _, d in ipairs(horse:GetDescendants()) do
+		if d:IsA("ProximityPrompt") and d.Enabled then
+			pcall(fireproximityprompt, d)
 			return true
 		end
 	end
-	return hum.Sit and hum.SeatPart ~= nil
-end
 
-local function _startFollowUnder(targetRoot: BasePart, yOffset: number)
-	local hrp = Root()
-	if _followConn then _followConn:Disconnect(); _followConn = nil end
-	_followConn = RunService.Heartbeat:Connect(function()
-		if not targetRoot or not targetRoot.Parent then
-			if _followConn then _followConn:Disconnect(); _followConn = nil end
-			if hrp then hrp.Anchored = false end
-			_setCollide(Char(), true)
-			return
+	-- (3) Remote
+	local r = findTameRemote()
+	if r then
+		if r:IsA("RemoteEvent") then
+			local ok = pcall(function() r:FireServer(horse) end)
+			if ok then return true end
+		else
+			local ok = pcall(function() r:InvokeServer(horse) end)
+			if ok then return true end
 		end
-		local pos = targetRoot.Position + Vector3.new(0, yOffset, 0)
-		hrp.CFrame = CFrame.new(pos, targetRoot.Position + Vector3.new(0, 2, 0))
-	end)
+	end
+
+	-- (4) Fallback world click at the part
+	if rightClickWorldPos then
+		rightClickWorldPos(part.Position)
+		return true
+	end
+	return false
 end
-
--- --- public API
-_G.RiderFreeze_IsGood = function()
-	local hum = Hum()
-	return hum
-	   and hum.Sit == true
-	   and hum.SeatPart ~= nil
-	   and hum:GetState() == Enum.HumanoidStateType.Seated
-end
-
-_G.RiderFreeze_Start = function(targetRoot: BasePart, yOffset: number?)
-	if _frozen then return true end
-	_frozen = true
-
-	local char = Char()
-	local hum = Hum()
-	local hrp = Root()
-
-	-- physics freeze + noclip
-	_setCollide(char, false)
-	hrp.Anchored = true
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.AssemblyAngularVelocity = Vector3.zero
-
-	-- follow-under (so we stick under flying targets)
-	_startFollowUnder(targetRoot, yOffset or -6)
-
-	-- lock humanoid to Seated and spoof SeatPart
-	_lockToSeated(hum)
-	local okSeat = _sitOnGhostSeat()
-
-	return okSeat and _G.RiderFreeze_IsGood()
-end
-
-_G.RiderFreeze_Stop = function()
-	if not _frozen then return end
-	_frozen = false
-
-	if _seatConn then _seatConn:Disconnect(); _seatConn = nil end
-	if _followConn then _followConn:Disconnect(); _followConn = nil end
-	if _ghostSeat then _ghostSeat:Destroy(); _ghostSeat = nil end
-
-	local char = Char()
-	local hum = Hum()
-	local hrp = Root()
-
-	_restoreStates(hum)
-	_setCollide(char, true)
-	hrp.Anchored = false
-	if hum.Sit then hum.Sit = false end
-end
--- ================== /Rider Freeze ==================
+-- ---- /helpers ----
 
 -- ===================== Tame Logic =====================
 
@@ -823,29 +769,23 @@ task.spawn(function()
 
 		-- 3) teleport directly under target and anchor self
 		if TARGET and TARGET_ROOT then
-			-- assuming TARGET (Model) and TARGET_ROOT (BasePart) are set
-            do
-                -- 1) enter “freeze as rider” mode and fly under the target
-                local ok = _G.RiderFreeze_Start(TARGET_ROOT, -6)
-                if not ok then
-                    tameStatus.Text = "Freeze rider failed — retrying next tick"
-                    continue
+			-- When you lock on a target:
+            _G.StartFollowUnder(TARGET_ROOT, -6)          -- 1) fly-follow under the horse
+            local ok = _G.EnsureRideSnapshot()            -- 2) force Seated/Sit/SeatPart trio (like your screenshot)
+            if not ok then
+                tameStatus.Text = "Ride snapshot not ready — retrying…"
+            else
+                -- 3) safe to lasso/tame; you're stuck under the target and “riding” by state
+                -- ensure lasso equipped + (optional) ensure rider snapshot/freezed mode here…
+
+                -- Try to tame by clicking directly on the target:
+                local clicked = clickOnTarget(TARGET)
+                if clicked then
+                    tameStatus.Text = "Clicked target (CD/Prompt/Remote/fallback)"
+                else
+                    tameStatus.Text = "No clickable path found; retrying…"
                 end
 
-                -- 2) guarantee we pass the game’s lasso gate
-                if not _G.RiderFreeze_IsGood() then
-                    -- try once more quickly
-                    task.wait(0.05)
-                    if not _G.RiderFreeze_IsGood() then
-                        tameStatus.Text = "Not in riding snapshot — skipping tame"
-                        continue
-                    end
-                end
-
-                -- 3) now do your taming action (right-click or prompt)
-                rightClickWorldPos(TARGET_ROOT.Position)  -- or tapKey(prompt.Key)
-
-                -- (your “tamed?” check goes here)
             end
 			
 		end
