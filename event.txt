@@ -1,0 +1,10 @@
+-- Debug: list all RemoteEvents and RemoteFunctions in ReplicatedStorage
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+print("=== Listing ReplicatedStorage Remotes ===")
+for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
+    if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+        print(inst.ClassName, inst:GetFullName())
+    end
+end
+print("=== End of list ===")

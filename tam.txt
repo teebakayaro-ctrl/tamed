@@ -1,15 +1,15 @@
 --!strict
--- Lasso Market (Torn + Western only) with draggable panel & minimize-to-icon
+-- Lasso Market (Torn + Western only) — draggable, minimize-to-icon, and Buy Now
+-- Quantities of 0 are skipped.
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LP = Players.LocalPlayer
 
--- =========================
--- ====== DATA ============
--- =========================
+-- =============== DATA =================
 type LassoItem = { id: string, name: string, price: number }
 local Catalog: {LassoItem} = {
     { id = "TornLasso",    name = "TornLasso",    price = 50 },
@@ -18,20 +18,7 @@ local Catalog: {LassoItem} = {
 local Order: { [string]: number } = {}
 for _, it in ipairs(Catalog) do Order[it.id] = 0 end
 
--- trigger stub
-_G.TriggerLassoPurchase = function()
-    print("[LassoMarket] Trigger called. Queue:")
-    for _, it in ipairs(Catalog) do
-        local q = Order[it.id]
-        if q > 0 then
-            print(("- %s x%d @ %d = %d"):format(it.name, q, it.price, it.price*q))
-        end
-    end
-end
-
--- =========================
--- ====== UI ============
--- =========================
+-- =============== UI ===================
 local PlayerGui = LP:WaitForChild("PlayerGui")
 
 local Screen = Instance.new("ScreenGui")
@@ -41,11 +28,10 @@ Screen.IgnoreGuiInset = true
 Screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 Screen.Parent = PlayerGui
 
--- main panel
 local Panel = Instance.new("Frame")
 Panel.Name = "Panel"
 Panel.Position = UDim2.new(0, 24, 0, 80)
-Panel.Size = UDim2.new(0, 360, 0, 200)
+Panel.Size = UDim2.new(0, 380, 0, 230)
 Panel.BackgroundColor3 = Color3.fromRGB(22,22,22)
 Panel.BackgroundTransparency = 0.1
 Panel.BorderSizePixel = 0
@@ -54,7 +40,9 @@ Panel.Parent = Screen
 
 -- drag
 do
-    local dragging, dragStart, startPos = false, nil, nil
+    local dragging = false
+    local dragStart: Vector2? = nil
+    local startPos: UDim2? = nil
     Panel.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
@@ -73,19 +61,17 @@ do
     end)
 end
 
--- title
-local title = Instance.new("TextLabel")
-title.BackgroundTransparency = 1
-title.Position = UDim2.new(0, 10, 0, 6)
-title.Size = UDim2.new(1, -40, 0, 20)
-title.Font = Enum.Font.Code
-title.TextSize = 16
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(220,255,220)
-title.Text = "Lasso Market (queue)"
-title.Parent = Panel
+local Title = Instance.new("TextLabel")
+Title.BackgroundTransparency = 1
+Title.Position = UDim2.new(0, 10, 0, 6)
+Title.Size = UDim2.new(1, -40, 0, 20)
+Title.Font = Enum.Font.Code
+Title.TextSize = 16
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.TextColor3 = Color3.fromRGB(220,255,220)
+Title.Text = "Lasso Market (queue)"
+Title.Parent = Panel
 
--- minimize button
 local MinBtn = Instance.new("TextButton")
 MinBtn.Position = UDim2.new(1, -28, 0, 4)
 MinBtn.Size = UDim2.new(0, 24, 0, 24)
@@ -95,16 +81,14 @@ MinBtn.BackgroundColor3 = Color3.fromRGB(40,40,40)
 MinBtn.BorderSizePixel = 0
 MinBtn.Parent = Panel
 
--- list area
 local List = Instance.new("Frame")
 List.Name = "List"
 List.Position = UDim2.new(0, 10, 0, 32)
-List.Size = UDim2.new(1, -20, 1, -50)
+List.Size = UDim2.new(1, -20, 0, 140)
 List.BackgroundTransparency = 1
 List.Parent = Panel
 
--- row template
-local function makeRow(it: LassoItem, y: number)
+local function row(it: LassoItem, y: number)
     local r = Instance.new("Frame")
     r.Size = UDim2.new(1, 0, 0, 28)
     r.Position = UDim2.new(0, 0, 0, y)
@@ -154,61 +138,69 @@ local function makeRow(it: LassoItem, y: number)
     plus.Position = UDim2.new(0.75,44,0,2)
     plus.Parent = r
 
-    -- logic
-    local function updateQty(n)
+    local function clamp(n: number) : number
+        if n ~= n then return 0 end
         if n < 0 then n = 0 end
         if n > 999 then n = 999 end
+        return math.floor(n + 0.0001)
+    end
+    local function setQty(n: number)
+        n = clamp(n)
         Order[it.id] = n
         qty.Text = tostring(n)
+        -- update total label immediately
+        local sum = 0
+        for _, it2 in ipairs(Catalog) do sum += (it2.price * (Order[it2.id] or 0)) end
+        Total.Text = "Queued total: "..tostring(sum)
     end
 
-    minus.MouseButton1Click:Connect(function()
-        updateQty(Order[it.id]-1)
-    end)
-    plus.MouseButton1Click:Connect(function()
-        updateQty(Order[it.id]+1)
-    end)
-    qty.FocusLost:Connect(function()
-        local n = tonumber(qty.Text) or 0
-        updateQty(n)
-    end)
+    minus.MouseButton1Click:Connect(function() setQty((Order[it.id] or 0) - 1) end)
+    plus.MouseButton1Click:Connect(function() setQty((Order[it.id] or 0) + 1) end)
+    qty.FocusLost:Connect(function() setQty(tonumber(qty.Text) or 0) end)
 end
 
-for i,it in ipairs(Catalog) do
-    makeRow(it,(i-1)*30)
-end
+for i,it in ipairs(Catalog) do row(it,(i-1)*30) end
 
--- total label
 local Total = Instance.new("TextLabel")
 Total.BackgroundTransparency = 1
-Total.Position = UDim2.new(0, 10, 1, -20)
-Total.Size = UDim2.new(1, -20, 0, 18)
+Total.Position = UDim2.new(0, 10, 0, 176)
+Total.Size = UDim2.new(0.6, 0, 0, 20)
 Total.Font = Enum.Font.Code
 Total.TextSize = 14
 Total.TextColor3 = Color3.fromRGB(235,255,235)
 Total.TextXAlignment = Enum.TextXAlignment.Left
-Total.Text = "Queued total: n/a"
+Total.Text = "Queued total: 0"
 Total.Parent = Panel
 
--- update total loop
-task.spawn(function()
-    while true do
-        task.wait(0.5)
-        local sum = 0
-        for _, it in ipairs(Catalog) do
-            local q = Order[it.id]
-            sum += it.price*q
-        end
-        Total.Text = "Queued total: "..tostring(sum)
-    end
-end)
+local BuyBtn = Instance.new("TextButton")
+BuyBtn.Position = UDim2.new(1, -110, 0, 172)
+BuyBtn.Size = UDim2.new(0, 100, 0, 26)
+BuyBtn.Text = "Buy Now"
+BuyBtn.Font = Enum.Font.Code
+BuyBtn.TextSize = 14
+BuyBtn.BackgroundColor3 = Color3.fromRGB(40,80,40)
+BuyBtn.TextColor3 = Color3.fromRGB(240,240,240)
+BuyBtn.BorderSizePixel = 0
+BuyBtn.Parent = Panel
 
--- small icon
+local Status = Instance.new("TextLabel")
+Status.Name = "Status"
+Status.BackgroundTransparency = 1
+Status.Position = UDim2.new(0, 10, 1, -22)
+Status.Size = UDim2.new(1, -20, 0, 18)
+Status.Font = Enum.Font.Code
+Status.TextSize = 13
+Status.TextXAlignment = Enum.TextXAlignment.Left
+Status.TextColor3 = Color3.fromRGB(200,200,200)
+Status.Text = "Ready."
+Status.Parent = Panel
+
+-- minimize to icon
 local Icon = Instance.new("TextButton")
 Icon.Name = "MiniIcon"
 Icon.Size = UDim2.new(0,40,0,40)
 Icon.Position = UDim2.new(0,24,0,80)
-Icon.Text = "🪢" -- lasso emoji-like
+Icon.Text = "🪢"
 Icon.Font = Enum.Font.SourceSansBold
 Icon.TextSize = 24
 Icon.BackgroundColor3 = Color3.fromRGB(35,35,35)
@@ -216,25 +208,132 @@ Icon.BorderSizePixel = 0
 Icon.Visible = false
 Icon.Parent = Screen
 
--- minimize / restore
 MinBtn.MouseButton1Click:Connect(function()
     Panel.Visible = false
     Icon.Visible = true
-    Icon.Position = Panel.Position -- dock where panel was
+    Icon.Position = Panel.Position
 end)
 Icon.MouseButton1Click:Connect(function()
     Panel.Visible = true
     Icon.Visible = false
 end)
 
--- hotkey J toggle
+-- hotkey: J toggles panel/icon
 UIS.InputBegan:Connect(function(input,gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.J then
-        local v = not Panel.Visible and not Icon.Visible
-        Panel.Visible = v
-        Icon.Visible = not v
+        local showingPanel = Panel.Visible
+        Panel.Visible = not showingPanel
+        Icon.Visible = showingPanel
+        if Icon.Visible then Icon.Position = Panel.Position end
     end
 end)
 
-print("[LassoMarket] ready. J = toggle panel, – = minimize to icon, click 🪢 icon to restore.")
+-- =============== PURCHASE ENGINE =================
+local BuyRemote: Instance? = nil
+local REMOTE_NAME_HINTS = { "buy", "purchase", "shopbuy", "storebuy", "purchaseitem", "buylasso" }
+
+local function setStatus(t: string)
+    Status.Text = t
+    print("[LassoMarket]", t)
+end
+
+local function discoverBuyRemote(): Instance?
+    if BuyRemote and BuyRemote.Parent then return BuyRemote end
+    for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
+        if inst:IsA("RemoteFunction") or inst:IsA("RemoteEvent") then
+            local lname = string.lower(inst.Name)
+            for _, hint in ipairs(REMOTE_NAME_HINTS) do
+                if lname:find(hint, 1, true) then
+                    BuyRemote = inst
+                    setStatus("Found buy remote: " .. inst.Name)
+                    return BuyRemote
+                end
+            end
+        end
+    end
+    setStatus("No buy remote found. You can set it via _G.LassoMarket.SetBuyRemote(<Instance>).")
+    return nil
+end
+
+-- try different payload shapes until one returns/doesn't error
+local function tryVariantsSend(remote: Instance, itemId: string, qty: number): (boolean, any)
+    local payloads = {
+        function() return itemId, qty end,
+        function() return { id = itemId, itemId = itemId, name = itemId, qty = qty, quantity = qty } end,
+        function() return itemId end,
+        function() return { itemId = itemId } end,
+        function() return { id = itemId, qty = qty } end,
+    }
+    for i, build in ipairs(payloads) do
+        local a, b = build()
+        local ok, res = pcall(function()
+            if remote:IsA("RemoteFunction") then
+                return remote:InvokeServer(a, b)
+            else
+                (remote :: RemoteEvent):FireServer(a, b)
+                return true
+            end
+        end)
+        if ok then
+            return true, res
+        end
+    end
+    return false, "All variants failed"
+end
+
+local function buyItem(itemId: string, qty: number): boolean
+    if qty <= 0 then return true end -- skip silently: 0 means don't buy
+    local r = discoverBuyRemote()
+    if not r then return false end
+    setStatus(("Buying %s x%d..."):format(itemId, qty))
+    local ok, res = tryVariantsSend(r, itemId, qty)
+    if ok then
+        setStatus(("Bought %s x%d (response: %s)"):format(itemId, qty, tostring(res)))
+        return true
+    else
+        setStatus(("Failed to buy %s x%d"):format(itemId, qty))
+        return false
+    end
+end
+
+local function buyQueued()
+    local any = false
+    for _, it in ipairs(Catalog) do
+        local q = Order[it.id] or 0
+        if q > 0 then any = true end
+    end
+    if not any then
+        setStatus("Nothing to buy (all quantities are 0).")
+        return
+    end
+    for _, it in ipairs(Catalog) do
+        local q = Order[it.id] or 0
+        if q > 0 then
+            local ok = buyItem(it.id, q)
+            if not ok then
+                -- keep going but note failure
+                setStatus(("Purchase attempt failed for %s."):format(it.id))
+            end
+        end
+    end
+end
+
+-- Hook up the button + global trigger
+BuyBtn.MouseButton1Click:Connect(buyQueued)
+
+_G.TriggerLassoPurchase = function()
+    buyQueued()
+end
+
+_G.LassoMarket = _G.LassoMarket or {}
+_G.LassoMarket.SetBuyRemote = function(inst: Instance?)
+    BuyRemote = inst
+    if BuyRemote then
+        setStatus("Buy remote set to: " .. BuyRemote:GetFullName())
+    else
+        setStatus("Buy remote cleared.")
+    end
+end
+
+print("[LassoMarket] Ready. Set your quantities then click Buy Now. Items with qty=0 are skipped.")
