@@ -75,6 +75,43 @@ local function isHorseLike(m: Instance): boolean
     end
     return false
 end
+-- === Teleport helpers ===
+local function myChar() return LP.Character or LP.CharacterAdded:Wait() end
+
+local function nearestHorse(origin: Vector3)
+    local bestModel: Model? = nil
+    local bestRoot: BasePart? = nil
+    local bestD = math.huge
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("Model") and isHorseLike(inst) then
+            local r = rootOf(inst)
+            if r then
+                local d = (r.Position - origin).Magnitude
+                if d < bestD then
+                    bestD, bestModel, bestRoot = d, inst, r
+                end
+            end
+        end
+    end
+    return bestModel, bestRoot, bestD
+end
+
+local function teleportUnderNearest(offsetY: number)
+    local c = myChar()
+    local hrp = rootOf(c) :: BasePart
+    if not hrp then return end
+
+    local _, horseRoot = nearestHorse(hrp.Position)
+    if not horseRoot then
+        warn("[HorseOverlay] No horse found to teleport under.")
+        return
+    end
+
+    local target = horseRoot.Position + Vector3.new(0, offsetY, 0)
+    -- keep your facing direction:
+    local look = hrp.CFrame.LookVector
+    hrp.CFrame = CFrame.new(target, target + look)
+end
 
 -- ================== OVERLAY ==================
 local overlays: {[Model]: BillboardGui} = {}
@@ -183,7 +220,7 @@ local function makeControlGui()
     title.Size = UDim2.new(1, -50, 0, 20)
     title.Font = Enum.Font.Code
     title.TextSize = 16
-    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextXAlignment = Enum.TextXAlignment.Center
     title.TextColor3 = Color3.fromRGB(220, 255, 220)
     title.Text = "Horse Overlay"
     title.Parent = panel
@@ -261,8 +298,11 @@ UIS.InputBegan:Connect(function(input, gpe)
     elseif input.KeyCode == Enum.KeyCode.U then
         STATE.uiVisible = not STATE.uiVisible
         applyUIState()
+    elseif input.KeyCode == Enum.KeyCode.T then
+        teleportUnderNearest(-50)  -- put you 50 studs below the nearest horse
     end
 end)
+
 
 -- ================== MAIN LOOP ==================
 task.spawn(function()
