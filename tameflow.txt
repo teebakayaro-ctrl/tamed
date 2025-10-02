@@ -1,0 +1,48 @@
+-- TameFlowSniffer.client.lua
+local RS = game:GetService("ReplicatedStorage")
+local Remotes = RS:WaitForChild("Remotes")
+
+local CANDIDATES = {
+	"GetTamingHorses",
+	"LassoSnappedRemote",
+	"TameTutorialHorseRemote",
+	"EnterTameContest",
+}
+
+local function getRemote(name)
+	for _, inst in ipairs(Remotes:GetChildren()) do
+		if inst.Name == name then return inst end
+	end
+	return nil
+end
+
+-- 1) Listen for server->client traffic
+for _, name in ipairs(CANDIDATES) do
+	local r = getRemote(name)
+	if r and r:IsA("RemoteEvent") then
+		r.OnClientEvent:Connect(function(...)
+			print(("[TameSniffer] OnClientEvent <%s> args:"):format(name), ...)
+		end)
+	end
+end
+
+-- 2) Tiny helper to probe calls safely
+local function tryFire(name, ...)
+	local r = getRemote(name)
+	if not r then return warn("[TameSniffer] Remote not found:", name) end
+	if r:IsA("RemoteEvent") then
+		print("[TameSniffer] FireServer ->", name, "args:", ...)
+		r:FireServer(...)
+	elseif r:IsA("RemoteFunction") then
+		local ok, res = pcall(function() return r:InvokeServer(...) end)
+		print("[TameSniffer] InvokeServer ->", name, "ok?", ok, "res:", res)
+	else
+		warn("[TameSniffer] Not a remote:", name, r.ClassName)
+	end
+end
+
+_G.TameProbe = {
+	Fire = tryFire,             -- _G.TameProbe.Fire("GetTamingHorses")
+	Get = function(n) return getRemote(n) end
+}
+print("[TameSniffer] Ready. Use _G.TameProbe.Fire('<Name>'[, args...]) in console while testing.")
