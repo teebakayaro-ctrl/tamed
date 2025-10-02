@@ -740,8 +740,6 @@ tameToggle.MouseButton1Click:Connect(function() setTameActive(not TAME_ACTIVE) e
 
 -- main loop
 task.spawn(function()
-	local hum = char():WaitForChild("Humanoid") :: Humanoid
-	hum.AutoRotate = true; hum.WalkSpeed = 16
 
 	while true do
 		task.wait(0.25)
@@ -770,13 +768,11 @@ task.spawn(function()
 		-- 3) teleport directly under target and anchor self
 		if TARGET and TARGET_ROOT then
 			-- When you lock on a target:
-            _G.StartFollowUnder(TARGET_ROOT, -10)          -- 1) fly-follow under the horse
+            _G.StartFollowUnder(TARGET_ROOT, -15)          -- 1) fly-follow under the horse
             local ok = _G.EnsureRideSnapshot()            -- 2) force Seated/Sit/SeatPart trio (like your screenshot)
             if not ok then
                 tameStatus.Text = "Ride snapshot not ready — retrying…"
             else
-                -- 3) safe to lasso/tame; you're stuck under the target and “riding” by state
-                -- ensure lasso equipped + (optional) ensure rider snapshot/freezed mode here…
 
                 -- Try to tame by clicking directly on the target:
                 local clicked = clickOnTarget(TARGET)

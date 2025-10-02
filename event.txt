@@ -1,10 +1,42 @@
--- Debug: list all RemoteEvents and RemoteFunctions in ReplicatedStorage
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+-- RemotesCatalog.lua
+local KEYWORDS = { "tame", "taming", "capture", "lasso", "sell", "stable", "horse", "equus", "contest" }
 
-print("=== Listing ReplicatedStorage Remotes ===")
-for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
-    if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
-        print(inst.ClassName, inst:GetFullName())
-    end
+local function looksRelevant(name)
+	name = string.lower(name)
+	for _, k in ipairs(KEYWORDS) do
+		if string.find(name, k, 1, true) then return true end
+	end
+	return false
 end
-print("=== End of list ===")
+
+local searchRoots = {
+	game:GetService("ReplicatedStorage"),
+	game:GetService("StarterPlayer"),
+	game:GetService("StarterGui"),
+}
+
+local found = {}
+
+for _, root in ipairs(searchRoots) do
+	for _, inst in ipairs(root:GetDescendants()) do
+		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+			if looksRelevant(inst.Name) or looksRelevant(inst.Parent and inst.Parent.Name or "") then
+				table.insert(found, inst)
+			end
+		end
+	end
+end
+
+print(("[RemotesCatalog] Candidates (%d):"):format(#found))
+for _, r in ipairs(found) do
+	print(("- %s (%s)"):format(r:GetFullName(), r.ClassName))
+end
+
+-- OPTIONAL: listen for server->client signals on each candidate
+for _, r in ipairs(found) do
+	if r:IsA("RemoteEvent") then
+		r.OnClientEvent:Connect(function(...)
+			print("[RemotesCatalog] OnClientEvent from", r:GetFullName(), "args:", ...)
+		end)
+	end
+end
