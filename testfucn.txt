@@ -1,7 +1,6 @@
 -- SafeTameSpy.client.lua
 local RS = game:GetService("ReplicatedStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
-local StarterGui = game:GetService("StarterGui")
 
 -- ---------- pretty dump ----------
 local function fullName(i)
@@ -68,7 +67,6 @@ end
 
 scan(RS)
 scan(StarterPlayer)
-scan(StarterGui)
 scan(RS:FindFirstChild("_replicationFolder"))
 
 -- ---------- optional client->server logging (only if allowed) ----------
