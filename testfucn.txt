@@ -1,195 +1,135 @@
--- FullTameSpy.client.lua
--- Put in StarterPlayerScripts. Logs remotes, lasso module calls, and client->server remote calls.
-local Players = game:GetService("Players")
+-- SafeTameSpy.client.lua
 local RS = game:GetService("ReplicatedStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
+local StarterGui = game:GetService("StarterGui")
 
-local LOG = {} -- ring buffer of events
-local MAX_LOG = 500
-local function push(entry)
-	entry.time = os.time()
-	table.insert(LOG, entry)
-	if #LOG > MAX_LOG then table.remove(LOG, 1) end
+-- ---------- pretty dump ----------
+local function fullName(i)
+  local t={}
+  while i do t[#t+1]=i.Name; i=i.Parent end
+  for l,r=1,#t//2 do t[l],t[#t-l+1]=t[#t-l+1],t[l] end
+  return table.concat(t,".")
 end
 
-local function shortTime() return os.date("%X") end
-
--- pretty dump (recursive, detects Instances nicely)
-local function getFullName(inst)
-    local parts = {}
-    while inst do
-        table.insert(parts, 1, inst.Name)
-        inst = inst.Parent
+local function dump(v, d, seen)
+  d, seen = d or 0, seen or {}
+  local pad = string.rep("  ", d)
+  local ty = typeof(v)
+  if ty=="table" then
+    if seen[v] then return pad.."{<cycle>}" end
+    seen[v]=true
+    local out={pad.."{\n"}
+    for k,val in pairs(v) do
+      out[#out+1]=pad.."  ["..tostring(k)..":"..typeof(k).."] = "..dump(val,d+1,seen).."\n"
     end
-    return table.concat(parts, ".")
-end
-
-local function dumpValue(v, depth, seen)
-	depth = depth or 0
-	seen = seen or {}
-	local pad = string.rep("  ", depth)
-	local t = typeof(v)
-	if t == "table" then
-		if seen[v] then return pad.."{<cycle>}" end
-		seen[v] = true
-		local out = { pad.."{\n" }
-		for k,val in pairs(v) do
-			table.insert(out, pad.."  ["..tostring(k)..":"..typeof(k).."] = "..dumpValue(val, depth+1, seen).."\n")
-		end
-		table.insert(out, pad.."}")
-		return table.concat(out)
-	elseif t == "Instance" then
-		return pad.."Instance("..v.ClassName.."):"..getFullName(v)
-	elseif t == "Vector3" or t == "CFrame" or t == "UDim2" or t == "Color3" then
-		return pad..t.."("..tostring(v)..")"
-	else
-		return pad..t.."("..tostring(v)..")"
-	end
+    out[#out+1]=pad.."}"
+    return table.concat(out)
+  elseif ty=="Instance" then
+    return pad.."Instance("..v.ClassName.."):"..fullName(v)
+  else
+    return pad..ty.."("..tostring(v)..")"
+  end
 end
 
 local function dumpArgs(args)
-	local out = {}
-	for i,v in ipairs(args) do
-		out[#out+1] = ("[%d] %s"):format(i, dumpValue(v))
-	end
-	return table.concat(out, "\n")
+  for i,v in ipairs(args) do
+    print(("  arg[%d]: %s"):format(i, dump(v)))
+  end
 end
 
--- ============== Remotes watcher (server->client) ==============
-local function hookRemoteClient(inst)
-	if not inst then return end
-	if inst:IsA("RemoteEvent") then
-		inst.OnClientEvent:Connect(function(...)
-			local args = {...}
-			local s = string.format("[%s] OnClientEvent <- %s", shortTime(), inst:GetFullName())
-			print(s)
-			print(dumpArgs(args))
-			push({type="OnClientEvent", remote=inst, name=inst:GetFullName(), args=args, stack=debug.traceback("",2)})
-		end)
-	elseif inst:IsA("RemoteFunction") then
-		-- override OnClientInvoke to observe server->client invokes
-		inst.OnClientInvoke = function(...)
-			local args = {...}
-			local s = string.format("[%s] OnClientInvoke <- %s", shortTime(), inst:GetFullName())
-			print(s)
-			print(dumpArgs(args))
-			push({type="OnClientInvoke", remote=inst, name=inst:GetFullName(), args=args, stack=debug.traceback("",2)})
-			return nil -- safe default
-		end
-	end
+-- ---------- server->client remote logging ----------
+local function hookRemote(r)
+  if r:IsA("RemoteEvent") then
+    r.OnClientEvent:Connect(function(...)
+      print("\n[Spy] OnClientEvent <-", r:GetFullName())
+      dumpArgs({...})
+    end)
+  elseif r:IsA("RemoteFunction") then
+    r.OnClientInvoke = function(...)
+      print("\n[Spy] OnClientInvoke <-", r:GetFullName())
+      dumpArgs({...})
+      return nil
+    end
+  end
 end
 
-local function scanAndHookRemotes(root)
-	if not root then return end
-	for _,d in ipairs(root:GetDescendants()) do
-		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-			hookRemoteClient(d)
-		end
-	end
-	root.DescendantAdded:Connect(function(inst)
-		if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
-			print("[Spy] New remote added:", inst:GetFullName(), inst.ClassName)
-			hookRemoteClient(inst)
-		end
-	end)
+local function scan(root)
+  if not root then return end
+  for _,x in ipairs(root:GetDescendants()) do
+    if x:IsA("RemoteEvent") or x:IsA("RemoteFunction") then hookRemote(x) end
+  end
+  root.DescendantAdded:Connect(function(x)
+    if x:IsA("RemoteEvent") or x:IsA("RemoteFunction") then
+      print("[Spy] New remote:", x:GetFullName(), x.ClassName)
+      hookRemote(x)
+    end
+  end)
 end
 
-scanAndHookRemotes(RS)
-scanAndHookRemotes(StarterPlayer)
-local repFolder = RS:FindFirstChild("_replicationFolder")
-if repFolder then scanAndHookRemotes(repFolder) end
+scan(RS)
+scan(StarterPlayer)
+scan(StarterGui)
+scan(RS:FindFirstChild("_replicationFolder"))
 
--- ============== Lasso module wrapping (if present) ==============
-local function tryWrapLasso()
-	local rf = RS:FindFirstChild("_replicationFolder")
-	if not rf then return end
-	local success, lassoModule = pcall(function() return require(rf:FindFirstChild("Lasso")) end)
-	if not success or not lassoModule then
-		-- not available or require blocked
-		return
-	end
-
-	-- wrap functions we care about
-	local function wrap(fn, name)
-		return function(...)
-			local args = {...}
-			print(("[%s] [LassoWrap] %s called with:\n%s"):format(shortTime(), name, dumpArgs(args)))
-			push({type="LassoCall", name=name, args=args, stack=debug.traceback("",2)})
-			return fn(...)
-		end
-	end
-
-	if type(lassoModule.doLasso) == "function" then
-		lassoModule.doLasso = wrap(lassoModule.doLasso, "doLasso")
-	end
-	if type(lassoModule._hit) == "function" then
-		lassoModule._hit = wrap(lassoModule._hit, "_hit")
-	end
-	-- wrap any other publicly available functions
-	for k,v in pairs(lassoModule) do
-		if type(v) == "function" and (k == "throw" or k == "attach" or k == "release") then
-			lassoModule[k] = wrap(v, k)
-		end
-	end
-
-	print("[Spy] Lasso module wrapped (if present).")
-end
-
--- Wait a moment for rep folder to be ready then try wrap
-delay(1, tryWrapLasso)
-
--- ============== namecall hook to catch client->server remotes ==============
+-- ---------- optional client->server logging (only if allowed) ----------
 do
-	local ok, mt = pcall(getrawmetatable, game)
-	if ok and mt then
-		local old = mt.__namecall
-		if old then
-			local protect = pcall(function() return make_writeable end) -- irrelevant, keep safe
-			local function newNamecall(self, ...)
-				local method = getnamecallmethod and getnamecallmethod() or ""
-				if (method == "FireServer" or method == "InvokeServer") and (self:IsA and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))) then
-					-- capture full stacktrace & args
-					local args = {...}
-					local name = (self.GetFullName and self:GetFullName()) or tostring(self)
-					print(string.format("[%s] %s -> %s", shortTime(), method, name))
-					print(dumpArgs(args))
-					push({type="ClientToServer", method=method, name=name, remote=self, args=args, stack=debug.traceback("",2)})
-				end
-				return old(self, ...)
-			end
-			pcall(function() mt.__namecall = newNamecall end)
-			print("[Spy] __namecall hook installed.")
-		else
-			print("[Spy] __namecall meta missing.")
-		end
-	else
-		print("[Spy] can't access metatable; namecall hook unavailable.")
-	end
+  local ok, mt = pcall(getrawmetatable, game)
+  if ok and mt and mt.__namecall then
+    local old = mt.__namecall
+    pcall(function() setreadonly(mt,false) end)
+    mt.__namecall = function(self, ...)
+      local m = getnamecallmethod and getnamecallmethod() or ""
+      if (m=="FireServer" or m=="InvokeServer") and typeof(self)=="Instance"
+         and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+        print(("\n[Spy] %s -> %s"):format(m, self:GetFullName()))
+        dumpArgs({...})
+      end
+      return old(self, ...)
+    end
+    pcall(function() setreadonly(mt,true) end)
+    print("[Spy] __namecall hook active.")
+  else
+    print("[Spy] __namecall hook unavailable here (that’s fine, server->client logs still work).")
+  end
 end
 
--- ============== convenience helpers ==============
-_G.FullTameSpy = {}
-_G.FullTameSpy.Log = LOG
-_G.FullTameSpy.DumpLog = function()
-	for i,e in ipairs(LOG) do
-		print(("--- Log #%d time:%s type:%s name:%s ---"):format(i, os.date("%c", e.time or 0), e.type or "-", e.name or "-"))
-		if e.args then print(dumpArgs(e.args)) end
-		if e.stack then print("stacktrace:", e.stack) end
-	end
-end
-_G.FullTameSpy.Replay = function(i)
-	local e = LOG[i]
-	if not e then return warn("No log at index", i) end
-	if e.type == "ClientToServer" and e.remote and e.remote.FireServer then
-		print("Replaying FireServer ->", e.name)
-		e.remote:FireServer(table.unpack(e.args))
-	elseif e.type == "ClientToServer" and e.remote and e.remote.InvokeServer then
-		print("Replaying InvokeServer ->", e.name)
-		local ok, res = pcall(function() return e.remote:InvokeServer(table.unpack(e.args)) end)
-		print("Invoke ok?", ok, "res:", res)
-	else
-		warn("Cannot replay this log type or remote no longer exists.")
-	end
+-- ---------- SAFE wrap of _replicationFolder.Lasso (if a ModuleScript) ----------
+local function safeWrap(modTbl, fnName)
+  local original = modTbl[fnName]
+  print(("[Lasso] %s exists? %s (%s)"):format(fnName, original~=nil, typeof(original)))
+  if type(original) ~= "function" then return end
+  modTbl[fnName] = function(...)
+    local args = {...}
+    print(("\n[Lasso] %s called with:"):format(fnName))
+    dumpArgs(args)
+    -- call original safely
+    local ok, a,b,c,d,e = pcall(original, table.unpack(args))
+    if not ok then warn("[Lasso] "..fnName.." error:", a) return end
+    return a,b,c,d,e
+  end
 end
 
-print("[FullTameSpy] Ready. Perform a tame now; watch console. Use _G.FullTameSpy.DumpLog() to print collected logs and _G.FullTameSpy.Replay(index) to replay.")
+do
+  local rf = RS:FindFirstChild("_replicationFolder")
+  if rf then
+    local lassoModule = rf:FindFirstChild("Lasso")
+    if lassoModule and lassoModule:IsA("ModuleScript") then
+      local ok, tbl = pcall(require, lassoModule)
+      if ok and type(tbl)=="table" then
+        print("[Lasso] Module required. Trying to wrap candidate functions…")
+        -- ONLY wrap if real functions; otherwise just report their type
+        safeWrap(tbl, "doLasso")
+        safeWrap(tbl, "_hit")
+        safeWrap(tbl, "throw")
+        safeWrap(tbl, "attach")
+        safeWrap(tbl, "release")
+      else
+        print("[Lasso] require() returned:", typeof(tbl))
+      end
+    else
+      print("[Lasso] Not a ModuleScript (or missing). Skipping function wrap.")
+    end
+  end
+end
+
+print("[SafeTameSpy] Ready. Do a normal tame and watch the console.")
