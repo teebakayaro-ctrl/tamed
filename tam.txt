@@ -770,7 +770,7 @@ task.spawn(function()
 		-- 3) teleport directly under target and anchor self
 		if TARGET and TARGET_ROOT then
 			-- When you lock on a target:
-            _G.StartFollowUnder(TARGET_ROOT, -6)          -- 1) fly-follow under the horse
+            _G.StartFollowUnder(TARGET_ROOT, -10)          -- 1) fly-follow under the horse
             local ok = _G.EnsureRideSnapshot()            -- 2) force Seated/Sit/SeatPart trio (like your screenshot)
             if not ok then
                 tameStatus.Text = "Ride snapshot not ready — retrying…"
