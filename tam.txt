@@ -398,6 +398,122 @@ _G.ForceSitOnHorse = function(horse: Instance)
     return false
 end
 
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LP = Players.LocalPlayer
+
+local function Char() return LP.Character or LP.CharacterAdded:Wait() end
+local function Hum() return Char():WaitForChild("Humanoid") end
+local function Root() return Char():WaitForChild("HumanoidRootPart") end
+
+-- ================== FOLLOW UNDER TARGET ==================
+local followConn: RBXScriptConnection? = nil
+local _followTarget: BasePart? = nil
+local _followOffsetY = -6
+
+_G.StartFollowUnder = function(targetRoot: BasePart, yOffset: number?)
+	if followConn then followConn:Disconnect(); followConn = nil end
+	_followTarget = targetRoot
+	_followOffsetY = yOffset or -6
+
+	-- make character immune to bumps while following
+	for _, p in ipairs(Char():GetDescendants()) do
+		if p:IsA("BasePart") then p.CanCollide = false end
+	end
+
+	local hrp = Root()
+	hrp.Anchored = true
+
+	followConn = RunService.Heartbeat:Connect(function()
+		if not _followTarget or not _followTarget.Parent then
+			if followConn then followConn:Disconnect(); followConn = nil end
+			hrp.Anchored = false
+			for _, p in ipairs(Char():GetDescendants()) do
+				if p:IsA("BasePart") then p.CanCollide = true end
+			end
+			return
+		end
+		local pos = _followTarget.Position + Vector3.new(0, _followOffsetY, 0)
+		hrp.CFrame = CFrame.new(pos, _followTarget.Position + Vector3.new(0, 2, 0))
+	end)
+end
+
+_G.StopFollow = function()
+	if followConn then followConn:Disconnect(); followConn = nil end
+	local hrp = Root()
+	hrp.Anchored = false
+	for _, p in ipairs(Char():GetDescendants()) do
+		if p:IsA("BasePart") then p.CanCollide = true end
+	end
+	_followTarget = nil
+end
+-- =========================================================
+
+-- ================== SEAT SPOOF (client) ==================
+-- Creates a local Seat under the character, invisible & non-collide,
+-- follows HRP tightly so Humanoid stays Seated with a SeatPart.
+local _ghostSeat: Seat? = nil
+local _seatConn: RBXScriptConnection? = nil
+
+local function createGhostSeat()
+	if _ghostSeat then return _ghostSeat end
+	local seat = Instance.new("Seat")
+	seat.Name = "GhostSeat_Local"
+	seat.Anchored = true
+	seat.Transparency = 1
+	seat.CanCollide = false
+	seat.Size = Vector3.new(2, 0.6, 2)
+	seat.TopSurface = Enum.SurfaceType.Smooth
+	seat.BottomSurface = Enum.SurfaceType.Smooth
+	seat.Parent = workspace -- local-only since created by client
+	_ghostSeat = seat
+	return seat
+end
+
+_G.SeatSpoof_Start = function()
+	local hum = Hum()
+	local hrp = Root()
+	local seat = createGhostSeat()
+
+	-- keep the seat glued to our HRP (a tiny offset so Sit() works)
+	if _seatConn then _seatConn:Disconnect(); _seatConn = nil end
+	_seatConn = RunService.Heartbeat:Connect(function()
+		if not _ghostSeat then return end
+		_ghostSeat.CFrame = hrp.CFrame * CFrame.new(0, -1.5, 0)
+	end)
+
+	-- zero velocity and sit
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+	seat:Sit(hum)
+
+	-- wait until the trio matches: Seated/Sit/SeatPart
+	for i=1,30 do
+		RunService.Heartbeat:Wait()
+		if hum.Sit and hum.SeatPart == seat and hum:GetState() == Enum.HumanoidStateType.Seated then
+			return true
+		end
+	end
+	return hum.Sit and hum.SeatPart ~= nil
+end
+
+_G.SeatSpoof_Stop = function()
+	if _seatConn then _seatConn:Disconnect(); _seatConn = nil end
+	local hum = Hum()
+	if hum and hum.Sit then hum.Sit = false end
+	if _ghostSeat then _ghostSeat:Destroy(); _ghostSeat = nil end
+end
+
+-- Convenience: ensure the exact “ride snapshot” before taming
+_G.EnsureRideSnapshot = function()
+	local hum = Hum()
+	if hum.Sit and hum.SeatPart and hum:GetState() == Enum.HumanoidStateType.Seated then
+		return true
+	end
+	return _G.SeatSpoof_Start()
+end
+-- =========================================================
+
 -- ===================== Tame Logic =====================
 
 -- inventory helpers (equip a lasso if we have one; otherwise buy one, then equip)
@@ -558,56 +674,16 @@ task.spawn(function()
 
 		-- 3) teleport directly under target and anchor self
 		if TARGET and TARGET_ROOT then
-			local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0)
-			if TeleportRemote then
-				pcall(function() TeleportRemote:InvokeServer(targetPos) end)
-			else
-				if hrp then hrp.CFrame = CFrame.new(targetPos) end
-			end
-			if hrp then hrp.Anchored = true end
-
-            local ok = _G.ForceSitOnHorse(TARGET)
+			-- When you lock on a target:
+            _G.StartFollowUnder(TARGET_ROOT, -6)          -- 1) fly-follow under the horse
+            local ok = _G.EnsureRideSnapshot()            -- 2) force Seated/Sit/SeatPart trio (like your screenshot)
             if not ok then
-                tameStatus.Text = "Could not mount horse — skipping tame"
-                continue
+                tameStatus.Text = "Ride snapshot not ready — retrying…"
+            else
+                -- 3) safe to lasso/tame; you're stuck under the target and “riding” by state
+                rightClickWorldPos(TARGET_ROOT.Position)  -- or activate the prompt
             end
-			-- 4) attempt to tame
-			-- try prompt first
-			local prompt = findTamePrompt(TARGET)
-			if prompt and prompt.Enabled then
-				local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
-				tapKey(key)
-				tameStatus.Text = "Trying to mount/tame via prompt…"
-			else
-				-- fall back to right-clicking the horse root/center
-				if os.clock() - LAST_CLICK_T > 0.25 then
-					rightClickWorldPos(TARGET_ROOT.Position)
-					LAST_CLICK_T = os.clock()
-					tameStatus.Text = "Right-clicking target to tame…"
-				end
-			end
-
-			-- lightweight "tamed?" heuristic: if prompt disappears or horse loses Tame/Mount prompts for >1s
-			local t0 = os.clock()
-			local tamedNow = false
-			for _ = 1, 8 do
-				task.wait(0.125)
-				local p2 = findTamePrompt(TARGET)
-				if (not p2) or (p2 and not p2.Enabled) then
-					tamedNow = true; break
-				end
-			end
-			if tamedNow then
-				logTameEvent("tamed", { dt = os.clock() - t0 })
-				tameStatus.Text = "Tamed! (logged)"
-				-- keep anchored a bit so the popup can appear (step 5 will read _G.TameLog)
-				task.delay(0.6, function()
-					local me = myRoot()
-					if me then me.Anchored = false end
-				end)
-				-- release current target so the loop can choose a new one next tick
-				TARGET, TARGET_ROOT = nil, nil
-			end
+			
 		end
 	end
 end)
