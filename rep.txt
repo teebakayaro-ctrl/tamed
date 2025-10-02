@@ -1,0 +1,38 @@
+-- Scan _replicationFolder for useful remotes
+
+local RS = game:GetService("ReplicatedStorage")
+
+local function pathOf(i: Instance): string
+    local parts = {}
+    local cur = i
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+    end
+    return table.concat(parts, ".")
+end
+
+local KEYWORDS = { "horse", "tame", "ride", "mount", "sell", "stable", "capture" }
+
+local function hasKeyword(s: string): boolean
+    local low = string.lower(s)
+    for _, k in ipairs(KEYWORDS) do
+        if low:find(k, 1, true) then return true end
+    end
+    return false
+end
+
+local folder = RS:FindFirstChild("_replicationFolder", true)
+if not folder then
+    warn("[Scan] _replicationFolder not found under ReplicatedStorage")
+else
+    print("=== scanning", pathOf(folder))
+    for _, d in ipairs(folder:GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            if hasKeyword(d.Name) or hasKeyword(pathOf(d)) then
+                print(("[%s] %s"):format(d.ClassName, pathOf(d)))
+            end
+        end
+    end
+    print("=== end scan ===")
+end
