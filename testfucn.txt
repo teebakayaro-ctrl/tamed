@@ -1,6 +1,5 @@
 -- SafeTameSpy.client.lua
 local RS = game:GetService("ReplicatedStorage")
-local StarterPlayer = game:GetService("StarterPlayer")
 
 -- ---------- pretty dump ----------
 local function fullName(i)
@@ -66,7 +65,5 @@ local function scan(root)
 end
 
 scan(RS)
-scan(StarterPlayer)
-scan(RS:FindFirstChild("_replicationFolder"))
 
 print("[SafeTameSpy] Ready. Do a normal tame and watch the console.")
