@@ -12,7 +12,7 @@ local LP = Players.LocalPlayer
 -- ================== CONFIG ==================
 local CFG = {
     SCAN_INTERVAL = 0.30,
-    MAX_RADIUS = 350,
+    MAX_RADIUS = 999,
     TEXT_SIZE = 16,
     TEXT_COLOR = Color3.fromRGB(235,255,235),
     STUDS_OFFSET_Y = 4,
