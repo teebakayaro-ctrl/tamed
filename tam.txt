@@ -1,26 +1,34 @@
 --!strict
--- Minimal Horse Overlay: Species + Distance only (transparent background)
--- Toggle with H
+-- Horse Overlay + Mini Control Panel (toggle + minimizable + draggable)
+-- H = toggle overlay, U = show/hide panel
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
-local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
 local LP = Players.LocalPlayer
 
-local CONFIG = {
-    SCAN_INTERVAL = 0.3,
+-- ================== CONFIG ==================
+local CFG = {
+    SCAN_INTERVAL = 0.30,
     MAX_RADIUS = 350,
     TEXT_SIZE = 16,
     TEXT_COLOR = Color3.fromRGB(235,255,235),
+    STUDS_OFFSET_Y = 4,
     SPECIES_ATTR = "Species",
     NAME_MATCH = { "Horse","Unicorn","Gargoyle","Equus","Bisorse","Pony","Caprine","Kelpie","Peryton","Fae","Plush","Flora","Cybred","Celestial","Saurequine","Hippocampus","Kirin","Cactaline","Clydesdale","Felorse","Akhal","Teke" },
     TAGS = { "Horse","WildHorse","Mount","Tameable" },
-    STUDS_OFFSET_Y = 4,
-    MAX_DISTANCE_ON_LABEL = 9999,
 }
 
+-- ================== STATE ==================
+local STATE = {
+    overlayEnabled = true,
+    uiVisible = true,
+    minimized = false,
+}
+
+-- ================== HELPERS ==================
 local function char() return LP.Character or LP.CharacterAdded:Wait() end
 local function rootOf(m: Model): BasePart?
     return m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
@@ -42,7 +50,7 @@ local function hasAnyTag(inst: Instance, tags: {string})
 end
 local function looksHorseyName(s: string): boolean
     local low = string.lower(s)
-    for _, frag in ipairs(CONFIG.NAME_MATCH) do
+    for _, frag in ipairs(CFG.NAME_MATCH) do
         if low:find(string.lower(frag)) then return true end
     end
     return false
@@ -55,8 +63,8 @@ local function isHorseLike(m: Instance): boolean
     if not m:IsA("Model") then return false end
     if isPlayerCharacter(m) then return false end
     if not rootOf(m) then return false end
-    if hasAnyTag(m, CONFIG.TAGS) then return true end
-    local spec = getAttr(m, CONFIG.SPECIES_ATTR)
+    if hasAnyTag(m, CFG.TAGS) then return true end
+    local spec = getAttr(m, CFG.SPECIES_ATTR)
     if type(spec) == "string" and looksHorseyName(spec) then return true end
     if looksHorseyName(m.Name) then return true end
     for _, d in ipairs(m:GetDescendants()) do
@@ -68,40 +76,33 @@ local function isHorseLike(m: Instance): boolean
     return false
 end
 
--- ===== Billboard (transparent) =====
+-- ================== OVERLAY ==================
+local overlays: {[Model]: BillboardGui} = {}
+
 local function makeBillboard(): BillboardGui
     local bb = Instance.new("BillboardGui")
     bb.Name = "HorseMiniBB"
     bb.AlwaysOnTop = true
     bb.Size = UDim2.fromOffset(260, 20)
-    bb.StudsOffset = Vector3.new(0, CONFIG.STUDS_OFFSET_Y, 0)
+    bb.StudsOffset = Vector3.new(0, CFG.STUDS_OFFSET_Y, 0)
     bb.MaxDistance = 500
     bb.LightInfluence = 0
-
-    -- Transparent background: no Frame. TextLabel only.
     local txt = Instance.new("TextLabel")
     txt.Name = "Text"
     txt.BackgroundTransparency = 1
     txt.Size = UDim2.fromScale(1, 1)
-    txt.Position = UDim2.fromOffset(0, 0)
-    txt.TextXAlignment = Enum.TextXAlignment.Center
+    txt.TextXAlignment = Enum.TextXAlignment.Left
     txt.Font = Enum.Font.Code
-    txt.TextSize = CONFIG.TEXT_SIZE
-    txt.TextColor3 = CONFIG.TEXT_COLOR
+    txt.TextSize = CFG.TEXT_SIZE
+    txt.TextColor3 = CFG.TEXT_COLOR
     txt.Text = ""
     txt.Parent = bb
-
-    -- Optional outline for readability (still transparent background)
-    local uiStroke = Instance.new("UIStroke")
-    uiStroke.Color = Color3.new(0,0,0)
-    uiStroke.Thickness = 1
-    uiStroke.Parent = txt
-
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.new(0,0,0)
+    stroke.Thickness = 1
+    stroke.Parent = txt
     return bb
 end
-
-local overlays: {[Model]: BillboardGui} = {}
-local active = true
 
 local function ensureOverlay(m: Model): BillboardGui
     local bb = overlays[m]
@@ -120,26 +121,156 @@ local function forgetOverlay(m: Model)
 end
 
 local function speciesOf(m: Model): string
-    local s = getAttr(m, CONFIG.SPECIES_ATTR)
+    local s = getAttr(m, CFG.SPECIES_ATTR)
     if type(s) == "string" and #s > 0 then return s end
-    for _, frag in ipairs(CONFIG.NAME_MATCH) do
+    for _, frag in ipairs(CFG.NAME_MATCH) do
         if string.lower(m.Name):find(string.lower(frag)) then return frag end
     end
     return "Unknown"
 end
 
--- ===== Main loop =====
+-- ================== UI (Control Panel) ==================
+local PlayerGui = LP:WaitForChild("PlayerGui")
+local ControlGui: ScreenGui
+local ToggleBtn: TextButton
+local MinBtn: TextButton
+
+local function makeControlGui()
+    ControlGui = Instance.new("ScreenGui")
+    ControlGui.Name = "HorseOverlayControl"
+    ControlGui.ResetOnSpawn = false
+    ControlGui.IgnoreGuiInset = true
+    ControlGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ControlGui.Parent = PlayerGui
+
+    local panel = Instance.new("Frame")
+    panel.Name = "Panel"
+    panel.Position = UDim2.new(0, 16, 0, 60)
+    panel.Size = UDim2.new(0, 220, 0, 64)
+    panel.BackgroundColor3 = Color3.fromRGB(22,22,22)
+    panel.BackgroundTransparency = 0.2
+    panel.BorderSizePixel = 0
+    panel.Active = true  -- for dragging
+    panel.Parent = ControlGui
+
+    -- simple drag
+    local dragging = false
+    local dragStart: Vector2? = nil
+    local startPos: UDim2? = nil
+    panel.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+        end
+    end)
+    panel.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement and dragStart and startPos then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, 10, 0, 6)
+    title.Size = UDim2.new(1, -50, 0, 20)
+    title.Font = Enum.Font.Code
+    title.TextSize = 16
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Color3.fromRGB(220, 255, 220)
+    title.Text = "Horse Overlay"
+    title.Parent = panel
+
+    MinBtn = Instance.new("TextButton")
+    MinBtn.Name = "Minimize"
+    MinBtn.Position = UDim2.new(1, -26, 0, 6)
+    MinBtn.Size = UDim2.new(0, 20, 0, 20)
+    MinBtn.Text = "–"
+    MinBtn.TextScaled = true
+    MinBtn.BackgroundColor3 = Color3.fromRGB(40,40,40)
+    MinBtn.BorderSizePixel = 0
+    MinBtn.Parent = panel
+
+    ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Name = "Toggle"
+    ToggleBtn.Position = UDim2.new(0, 10, 0, 32)
+    ToggleBtn.Size = UDim2.new(0, 200, 0, 24)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(35,35,35)
+    ToggleBtn.BorderSizePixel = 0
+    ToggleBtn.Font = Enum.Font.Code
+    ToggleBtn.TextSize = 14
+    ToggleBtn.TextColor3 = Color3.fromRGB(240,240,240)
+    ToggleBtn.Text = ""
+    ToggleBtn.Parent = panel
+end
+
+local function applyUIState()
+    if not ControlGui then return end
+    ControlGui.Enabled = STATE.uiVisible
+
+    if ToggleBtn then
+        ToggleBtn.Text = STATE.overlayEnabled and "Overlay: ON   (press H)" or "Overlay: OFF   (press H)"
+        ToggleBtn.BackgroundColor3 = STATE.overlayEnabled and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
+    end
+
+    if MinBtn and ControlGui:FindFirstChild("Panel") then
+        local panel = ControlGui.Panel
+        if STATE.minimized then
+            panel.Size = UDim2.new(0, 220, 0, 28)
+            MinBtn.Text = "+"
+            if ToggleBtn then ToggleBtn.Visible = false end
+        else
+            panel.Size = UDim2.new(0, 220, 0, 64)
+            MinBtn.Text = "–"
+            if ToggleBtn then ToggleBtn.Visible = true end
+        end
+    end
+
+    -- reflect overlay visibility immediately
+    for _, bb in pairs(overlays) do
+        bb.Enabled = STATE.overlayEnabled
+    end
+end
+
+makeControlGui()
+applyUIState()
+
+ToggleBtn.MouseButton1Click:Connect(function()
+    STATE.overlayEnabled = not STATE.overlayEnabled
+    applyUIState()
+end)
+
+MinBtn.MouseButton1Click:Connect(function()
+    STATE.minimized = not STATE.minimized
+    applyUIState()
+end)
+
+-- hotkeys
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.H then
+        STATE.overlayEnabled = not STATE.overlayEnabled
+        applyUIState()
+    elseif input.KeyCode == Enum.KeyCode.U then
+        STATE.uiVisible = not STATE.uiVisible
+        applyUIState()
+    end
+end)
+
+-- ================== MAIN LOOP ==================
 task.spawn(function()
     local c = char()
     local myRoot = rootOf(c) :: BasePart
 
     while true do
-        task.wait(CONFIG.SCAN_INTERVAL)
-
-        if not active then
-            for _, bb in pairs(overlays) do bb.Enabled = false end
-            continue
-        end
+        task.wait(CFG.SCAN_INTERVAL)
 
         if not myRoot or not myRoot.Parent then
             c = char(); myRoot = rootOf(c) :: BasePart
@@ -149,31 +280,25 @@ task.spawn(function()
         local seen: {[Model]: boolean} = {}
         for _, inst in ipairs(Workspace:GetDescendants()) do
             if inst:IsA("Model") and isHorseLike(inst) then
-                local root = rootOf(inst)
-                if root then
-                    local dist = (root.Position - origin).Magnitude
-                    if dist <= CONFIG.MAX_RADIUS then
-                        local bb = ensureOverlay(inst); bb.Enabled = true
+                local r = rootOf(inst)
+                if r then
+                    local dist = (r.Position - origin).Magnitude
+                    if dist <= CFG.MAX_RADIUS then
+                        local bb = ensureOverlay(inst)
+                        bb.Enabled = STATE.overlayEnabled
                         local label = (bb:FindFirstChild("Text") :: TextLabel)
-                        label.Text = string.format("%s — %.1f", speciesOf(inst), math.min(dist, CONFIG.MAX_DISTANCE_ON_LABEL))
+                        label.Text = string.format("%s — %.1f", speciesOf(inst), dist)
                         seen[inst] = true
                     end
                 end
             end
         end
 
+        -- cleanup stale
         for m in pairs(overlays) do
-            if not m.Parent or not seen[m] then forgetOverlay(m) end
+            if not m.Parent or not seen[m] then
+                forgetOverlay(m)
+            end
         end
-    end
-end)
-
--- Toggle overlays
-UIS.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.H then
-        active = not active
-        for _, bb in pairs(overlays) do bb.Enabled = active end
-        print(("[HorseMini] %s"):format(active and "ON" or "OFF"))
     end
 end)
