@@ -370,28 +370,135 @@ buyBtn.MouseButton1Click:Connect(buyQueued)
 _G.TriggerLassoPurchase = function() buyQueued() end
 
 -- ===================== Tame Logic =====================
+
+-- inventory helpers (equip a lasso if we have one; otherwise buy one, then equip)
+local Backpack = LP:WaitForChild("Backpack")
+local function findToolByNames(names: {string}): Tool?
+	for _, tool in ipairs(Backpack:GetChildren()) do
+		if tool:IsA("Tool") then
+			for _, n in ipairs(names) do
+				if string.lower(tool.Name) == string.lower(n) then
+					return tool
+				end
+			end
+		end
+	end
+	-- also check currently equipped tool on character
+	local charModel = char()
+	for _, t in ipairs(charModel:GetChildren()) do
+		if t:IsA("Tool") then
+			for _, n in ipairs(names) do
+				if string.lower(t.Name) == string.lower(n) then
+					return t
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function equipTool(tool: Tool?)
+	if not tool then return false end
+	local ch = char()
+	local hum = ch:FindFirstChildOfClass("Humanoid")
+	if not hum then return false end
+	local ok = pcall(function() hum:EquipTool(tool) end)
+	return ok
+end
+
+-- Build preferred lasso order:
+-- 1) any catalog item you already own (in the order user set in the market UI: non-0 first)
+-- 2) otherwise, first catalog item
+local function preferredLassoName(): string?
+	local nonZero: {string} = {}
+	for _, it in ipairs(Catalog) do
+		if (Order[it.id] or 0) > 0 then table.insert(nonZero, it.name) end
+	end
+	if #nonZero > 0 then return nonZero[1] end
+	return (Catalog[1] and Catalog[1].name) or nil
+end
+
+local function ensureLassoEquipped(): boolean
+	local names = {}
+	-- prefer items user selected in the market first
+	for _, it in ipairs(Catalog) do
+		if (Order[it.id] or 0) > 0 then table.insert(names, it.name) end
+	end
+	-- then try all catalog names
+	for _, it in ipairs(Catalog) do table.insert(names, it.name) end
+
+	local have = findToolByNames(names)
+	if have then return equipTool(have) end
+
+	-- no lasso found → attempt to buy the first catalog lasso then equip on arrival
+	local first = Catalog[1]
+	if first then
+		Order[first.id] = math.max(1, Order[first.id] or 0)
+		if _G.TriggerLassoPurchase then _G.TriggerLassoPurchase() end
+		-- wait briefly for inventory to update
+		for _ = 1, 40 do
+			task.wait(0.1)
+			local got = findToolByNames({ first.name })
+			if got then return equipTool(got) end
+		end
+	end
+	return false
+end
+
+-- right-click helper
+local successVIM, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
+local function rightClickWorldPos(worldPos: Vector3)
+	if not (successVIM and VIM) then return end
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local viewportPos, onScreen = cam:WorldToViewportPoint(worldPos)
+	if not onScreen then
+		-- still move the mouse near the center as a fallback
+		viewportPos = Vector3.new(cam.ViewportSize.X/2, cam.ViewportSize.Y/2, 0)
+	end
+	-- Move cursor and send RIGHT mouse down/up
+	VIM:SendMouseMoveEvent(viewportPos.X, viewportPos.Y, game)
+	task.wait(0.02)
+	VIM:SendMouseButtonEvent(viewportPos.X, viewportPos.Y, 1, true, game, 0)  -- 1 = Right
+	task.wait(0.04)
+	VIM:SendMouseButtonEvent(viewportPos.X, viewportPos.Y, 1, false, game, 0)
+end
+
+-- tame session state + log
 local TAME_ACTIVE = false
 local TARGET: Model? = nil
 local TARGET_ROOT: BasePart? = nil
-local FOLLOW_RANGE = 18
-local REPTHRESH = 45
+local LAST_CLICK_T = 0
+_G.TameLog = _G.TameLog or {}
+
+local function logTameEvent(kind: string, extra: table?)
+	local entry = {
+		time = os.time(),
+		kind = kind,
+		target = TARGET and TARGET:GetFullName() or "nil",
+		species = TARGET and speciesOf(TARGET) or "Unknown",
+		pos = TARGET_ROOT and TARGET_ROOT.Position,
+		extra = extra or {},
+	}
+	table.insert(_G.TameLog, entry)
+	print("[TameLog]", kind, entry.species, entry.target)
+end
 
 local function setTameActive(v: boolean)
 	TAME_ACTIVE = v
 	tameToggle.Text = v and "ON" or "OFF"
 	tameToggle.BackgroundColor3 = v and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
 	tameStatus.Text = v and "Seeking nearest horse…" or "Paused."
-	if not v then 
-        TARGET, TARGET_ROOT = nil, nil; 
-        tameTarget.Text = "Target: n/a";
-        local hrp = myRoot()
-        if hrp then
-            hrp.Anchored = false
-        end
-    end
+	if not v then
+		TARGET, TARGET_ROOT = nil, nil
+		tameTarget.Text = "Target: n/a"
+		local hrp = myRoot()
+		if hrp then hrp.Anchored = false end
+	end
 end
 tameToggle.MouseButton1Click:Connect(function() setTameActive(not TAME_ACTIVE) end)
 
+-- main loop
 task.spawn(function()
 	local hum = char():WaitForChild("Humanoid") :: Humanoid
 	hum.AutoRotate = true; hum.WalkSpeed = 16
@@ -399,68 +506,74 @@ task.spawn(function()
 	while true do
 		task.wait(0.25)
 		local hrp = myRoot(); if not hrp then continue end
-
 		if not TAME_ACTIVE then continue end
+
+		-- 2) ensure lasso equipped (non-0 first; else first catalog)
+		local okEquip = ensureLassoEquipped()
+		if not okEquip then
+			tameStatus.Text = "No lasso yet—trying to purchase/equip…"
+		end
 
 		-- acquire target if needed
 		if (not TARGET) or (not TARGET.Parent) then
-			local t, tR, d = nil, nil, math.huge
-			if not t then t, tR, d = nearestHorse(hrp.Position) end
+			local t, tR = nearestHorse(hrp.Position)
 			TARGET, TARGET_ROOT = t, tR
 			if TARGET and TARGET_ROOT then
 				tameTarget.Text = string.format("Target: %s (%.1f)", speciesOf(TARGET), (TARGET_ROOT.Position - hrp.Position).Magnitude)
 				tameStatus.Text = "Target acquired."
+				logTameEvent("target_acquired")
 			else
 				tameTarget.Text = "Target: n/a"; tameStatus.Text = "No horse found."
 			end
 		end
 
-		-- Instead of walking, teleport directly onto target
-        if TARGET and TARGET_ROOT then
-            local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0) -- slightly above back
-            -- Use TeleportRemote if available, else client-set CFrame
-            if TeleportRemote then
-                pcall(function()
-                    TeleportRemote:InvokeServer(targetPos)
-                end)
-            else
-                local hrp = myRoot()
-                if hrp then hrp.CFrame = CFrame.new(targetPos) end
-            end
-            -- "Lock" yourself on the horse
-            local hrp = myRoot()
-            if hrp then
-                hrp.Anchored = true  -- pin your character
-            end
+		-- 3) teleport directly under target and anchor self
+		if TARGET and TARGET_ROOT then
+			local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0)
+			if TeleportRemote then
+				pcall(function() TeleportRemote:InvokeServer(targetPos) end)
+			else
+				if hrp then hrp.CFrame = CFrame.new(targetPos) end
+			end
+			if hrp then hrp.Anchored = true end
 
-            -- now spam the Tame/Mount prompt
-            local prompt = findTamePrompt(TARGET)
-            if prompt and prompt.Enabled then
-                local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
-                tapKey(key)
-                tameStatus.Text = "Trying to mount/tame…"
-            end
-        end
+			-- 4) attempt to tame
+			-- try prompt first
+			local prompt = findTamePrompt(TARGET)
+			if prompt and prompt.Enabled then
+				local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
+				tapKey(key)
+				tameStatus.Text = "Trying to mount/tame via prompt…"
+			else
+				-- fall back to right-clicking the horse root/center
+				if os.clock() - LAST_CLICK_T > 0.25 then
+					rightClickWorldPos(TARGET_ROOT.Position)
+					LAST_CLICK_T = os.clock()
+					tameStatus.Text = "Right-clicking target to tame…"
+				end
+			end
 
+			-- lightweight "tamed?" heuristic: if prompt disappears or horse loses Tame/Mount prompts for >1s
+			local t0 = os.clock()
+			local tamedNow = false
+			for _ = 1, 8 do
+				task.wait(0.125)
+				local p2 = findTamePrompt(TARGET)
+				if (not p2) or (p2 and not p2.Enabled) then
+					tamedNow = true; break
+				end
+			end
+			if tamedNow then
+				logTameEvent("tamed", { dt = os.clock() - t0 })
+				tameStatus.Text = "Tamed! (logged)"
+				-- keep anchored a bit so the popup can appear (step 5 will read _G.TameLog)
+				task.delay(0.6, function()
+					local me = myRoot()
+					if me then me.Anchored = false end
+				end)
+				-- release current target so the loop can choose a new one next tick
+				TARGET, TARGET_ROOT = nil, nil
+			end
+		end
 	end
-end)
-
--- Debug: test GetTamingHorses with V
-UIS.InputBegan:Connect(function(input,gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.V then
-        if GetTamingHorses then
-            local ok, list = pcall(function() return GetTamingHorses:InvokeServer() end)
-            print("[Debug V] GetTamingHorses result:", ok, list)
-            if ok and typeof(list)=="table" then
-                for i, h in ipairs(list) do
-                    if typeof(h)=="Instance" then
-                        print("Horse", i, h.Name, "Attrs:", h:GetAttributes())
-                    end
-                end
-            end
-        else
-            warn("GetTamingHorses remote not found")
-        end
-    end
 end)
