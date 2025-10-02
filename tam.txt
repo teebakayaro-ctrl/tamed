@@ -1,40 +1,29 @@
 --!strict
--- Horse Overhead Info (Client-only overlays for horse-like species)
+-- Minimal Horse Overlay: Species + Distance only (transparent background)
 -- Toggle with H
--- StarterPlayerScripts → LocalScript
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local UIS = game:GetService("UserInputService")
-
 local LP = Players.LocalPlayer
 
--- ======== CONFIG ========
 local CONFIG = {
     SCAN_INTERVAL = 0.3,
-    MAX_RADIUS = 350,         -- only show overlays for horses within this many studs
-    TEXT_SIZE = 14,
-    MAX_LINES = 3,
-    TAGS = { "Horse", "WildHorse", "Mount", "Tameable" }, -- if game uses tags
+    MAX_RADIUS = 350,
+    TEXT_SIZE = 16,
+    TEXT_COLOR = Color3.fromRGB(235,255,235),
+    SPECIES_ATTR = "Species",
     NAME_MATCH = { "Horse","Unicorn","Gargoyle","Equus","Bisorse","Pony","Caprine","Kelpie","Peryton","Fae","Plush","Flora","Cybred","Celestial","Saurequine","Hippocampus","Kirin","Cactaline","Clydesdale","Felorse","Akhal","Teke" },
-    ATTR_SPECIES_KEY = "Species", -- common in many games
-    ATTR_WILD_KEY    = "Wild",
-    ATTR_TAMED_KEY   = "Tamed",
-    ATTR_OWNER_KEYS  = { "Owner","OwnerName" },
-    UI_OFFSET_Y = 4,          -- studs above head/root
-    REQUIRE_ROOT = true,      -- true = needs a HumanoidRootPart or similar
+    TAGS = { "Horse","WildHorse","Mount","Tameable" },
+    STUDS_OFFSET_Y = 4,
+    MAX_DISTANCE_ON_LABEL = 9999,
 }
 
--- ======== Helpers ========
-local function getChar()
-    return LP.Character or LP.CharacterAdded:Wait()
-end
-local function hrpOf(m: Model): BasePart?
-    return m:FindFirstChild("HumanoidRootPart")
-        or m:FindFirstChild("Torso")
-        or m:FindFirstChildWhichIsA("BasePart")
+local function char() return LP.Character or LP.CharacterAdded:Wait() end
+local function rootOf(m: Model): BasePart?
+    return m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
 end
 local function isPlayerCharacter(m: Instance): boolean
     if not m:IsA("Model") then return false end
@@ -47,255 +36,144 @@ local function isPlayerCharacter(m: Instance): boolean
     end
     return false
 end
-local function hasAnyTag(m: Instance, tags: {string}): boolean
-    for _, t in ipairs(tags) do
-        if CollectionService:HasTag(m, t) then return true end
-    end
+local function hasAnyTag(inst: Instance, tags: {string})
+    for _, t in ipairs(tags) do if CollectionService:HasTag(inst, t) then return true end end
     return false
 end
-local function nameLooksLikeHorse(s: string): boolean
+local function looksHorseyName(s: string): boolean
     local low = string.lower(s)
     for _, frag in ipairs(CONFIG.NAME_MATCH) do
         if low:find(string.lower(frag)) then return true end
     end
     return false
 end
-local function getAttr(inst: Instance, key: string): any
-    local ok, v = pcall(function() return inst:GetAttribute(key) end)
+local function getAttr(inst: Instance, k: string)
+    local ok, v = pcall(function() return inst:GetAttribute(k) end)
     return ok and v or nil
 end
-local function getFirstAttr(inst: Instance, keys: {string})
-    for _, k in ipairs(keys) do
-        local v = getAttr(inst, k)
-        if v ~= nil then return v end
-    end
-    return nil
-end
-local function nearestPromptInfo(m: Model): string
-    local bestText, bestKey = nil, nil
-    for _, d in ipairs(m:GetDescendants()) do
-        if d:IsA("ProximityPrompt") then
-            local act = d.ActionText or ""
-            local obj = d.ObjectText or ""
-            local both = (act ~= "" and act or obj)
-            bestText = both ~= "" and both or "Interact"
-            bestKey = tostring(d.KeyboardKeyCode):gsub("Enum%.KeyCode%.","")
-            break
-        end
-    end
-    if bestText then
-        return ("%s[%s]"):format(bestText, bestKey or "?")
-    end
-    return "n/a"
-end
-
--- speed estimate per model
-local lastPos: {[Instance]: Vector3} = {}
-local lastTime: {[Instance]: number} = {}
-local function estimateSpeed(m: Model): number
-    local root = hrpOf(m)
-    if not root then return 0 end
-    local now = time()
-    local prevP, prevT = lastPos[m], lastTime[m]
-    lastPos[m], lastTime[m] = root.Position, now
-    if prevP and prevT then
-        local dt = math.max(1e-3, now - prevT)
-        return (root.Position - prevP).Magnitude / dt
-    end
-    return 0
-end
-
--- Identify horse-like NPCs
 local function isHorseLike(m: Instance): boolean
     if not m:IsA("Model") then return false end
     if isPlayerCharacter(m) then return false end
-    if CONFIG.REQUIRE_ROOT and not hrpOf(m) then return false end
+    if not rootOf(m) then return false end
     if hasAnyTag(m, CONFIG.TAGS) then return true end
-    local spec = getAttr(m, CONFIG.ATTR_SPECIES_KEY)
-    if type(spec) == "string" and nameLooksLikeHorse(spec) then return true end
-    if nameLooksLikeHorse(m.Name) then return true end
-    -- look for a Tame/Mount prompt as a hint
+    local spec = getAttr(m, CONFIG.SPECIES_ATTR)
+    if type(spec) == "string" and looksHorseyName(spec) then return true end
+    if looksHorseyName(m.Name) then return true end
     for _, d in ipairs(m:GetDescendants()) do
         if d:IsA("ProximityPrompt") then
             local t = string.lower((d.ActionText or "") .. " " .. (d.ObjectText or ""))
-            if t:find("tame") or t:find("mount") or t:find("ride") then
-                return true
-            end
+            if t:find("tame") or t:find("mount") or t:find("ride") then return true end
         end
     end
     return false
 end
 
--- ======== Overlay (Billboard) ========
-local function createBillboard(): BillboardGui
+-- ===== Billboard (transparent) =====
+local function makeBillboard(): BillboardGui
     local bb = Instance.new("BillboardGui")
-    bb.Name = "HorseInfoBB"
-    bb.Size = UDim2.new(0, 260, 0, 60)
+    bb.Name = "HorseMiniBB"
     bb.AlwaysOnTop = true
-    bb.LightInfluence = 0
-    bb.StudsOffset = Vector3.new(0, CONFIG.UI_OFFSET_Y, 0)
+    bb.Size = UDim2.fromOffset(260, 20)
+    bb.StudsOffset = Vector3.new(0, CONFIG.STUDS_OFFSET_Y, 0)
     bb.MaxDistance = 500
+    bb.LightInfluence = 0
 
-    local bg = Instance.new("Frame")
-    bg.Size = UDim2.new(1, 0, 1, 0)
-    bg.BackgroundTransparency = 0.35
-    bg.BackgroundColor3 = Color3.fromRGB(12, 12, 12)
-    bg.BorderSizePixel = 0
-    bg.Parent = bb
+    -- Transparent background: no Frame. TextLabel only.
+    local txt = Instance.new("TextLabel")
+    txt.Name = "Text"
+    txt.BackgroundTransparency = 1
+    txt.Size = UDim2.fromScale(1, 1)
+    txt.Position = UDim2.fromOffset(0, 0)
+    txt.TextXAlignment = Enum.TextXAlignment.Center
+    txt.Font = Enum.Font.Code
+    txt.TextSize = CONFIG.TEXT_SIZE
+    txt.TextColor3 = CONFIG.TEXT_COLOR
+    txt.Text = ""
+    txt.Parent = bb
 
-    local tl = Instance.new("TextLabel")
-    tl.Name = "Line1"
-    tl.BackgroundTransparency = 1
-    tl.Position = UDim2.new(0, 6, 0, 2)
-    tl.Size = UDim2.new(1, -12, 0, 18)
-    tl.Font = Enum.Font.Code
-    tl.TextSize = CONFIG.TEXT_SIZE
-    tl.TextXAlignment = Enum.TextXAlignment.Left
-    tl.TextColor3 = Color3.fromRGB(235, 255, 235)
-    tl.Text = ""
-    tl.Parent = bg
-
-    local l2 = tl:Clone(); l2.Name = "Line2"; l2.Position = UDim2.new(0,6,0,20); l2.Parent = bg
-    local l3 = tl:Clone(); l3.Name = "Line3"; l3.Position = UDim2.new(0,6,0,38); l3.Parent = bg
+    -- Optional outline for readability (still transparent background)
+    local uiStroke = Instance.new("UIStroke")
+    uiStroke.Color = Color3.new(0,0,0)
+    uiStroke.Thickness = 1
+    uiStroke.Parent = txt
 
     return bb
 end
 
-local function ensureBillboard(m: Model): BillboardGui
-    local existing = m:FindFirstChild("HorseInfoBB")
-    if existing and existing:IsA("BillboardGui") then
-        return existing
-    end
-    local root = hrpOf(m)
-    if not root then
-        error("No root to attach BillboardGui")
-    end
-    local bb = createBillboard()
+local overlays: {[Model]: BillboardGui} = {}
+local active = true
+
+local function ensureOverlay(m: Model): BillboardGui
+    local bb = overlays[m]
+    if bb and bb.Parent then return bb end
+    local root = rootOf(m); if not root then error("no root") end
+    bb = makeBillboard()
     bb.Adornee = root
     bb.Parent = m
-    return bb
-end
-
--- ======== Manager ========
-local active = true
-local overlays: {[Model]: BillboardGui} = {}
-local function setOverlayVisible(bb: BillboardGui, vis: boolean)
-    bb.Enabled = vis
-end
-
-local function displayFor(m: Model, origin: Vector3)
-    local root = hrpOf(m); if not root then return end
-    local dist = (root.Position - origin).Magnitude
-    if dist > CONFIG.MAX_RADIUS then
-        local bb = overlays[m]
-        if bb then setOverlayVisible(bb, false) end
-        return
-    end
-
-    local bb = overlays[m] or ensureBillboard(m)
     overlays[m] = bb
-    setOverlayVisible(bb, true)
-
-    -- data
-    local species = (getAttr(m, CONFIG.ATTR_SPECIES_KEY) :: any)
-    if type(species) ~= "string" then
-        -- guess from name
-        for _, frag in ipairs(CONFIG.NAME_MATCH) do
-            if string.lower(m.Name):find(string.lower(frag)) then
-                species = frag; break
-            end
-        end
-        species = species or "Unknown"
-    end
-
-    local owner = getFirstAttr(m, CONFIG.ATTR_OWNER_KEYS)
-    local wildFlag = getAttr(m, CONFIG.ATTR_WILD_KEY)
-    local tamedFlag = getAttr(m, CONFIG.ATTR_TAMED_KEY)
-    local stateStr = ""
-    if wildFlag ~= nil then
-        stateStr = wildFlag and "Wild" or "Not Wild"
-    elseif tamedFlag ~= nil then
-        stateStr = (tamedFlag == true) and "Tamed" or "Wild"
-    elseif owner ~= nil then
-        stateStr = "Owned"
-    else
-        stateStr = "Wild?"
-    end
-
-    local spd = estimateSpeed(m)
-    local promptStr = nearestPromptInfo(m)
-
-    -- color cue
-    local color = Color3.fromRGB(160, 220, 160) -- default (wild-ish)
-    if owner ~= nil or tamedFlag == true then
-        color = Color3.fromRGB(160, 200, 255)
-    end
-
-    -- write lines
-    local bg = bb:FindFirstChildOfClass("Frame") :: Frame
-    local line1 = bg:FindFirstChild("Line1") :: TextLabel
-    local line2 = bg:FindFirstChild("Line2") :: TextLabel
-    local line3 = bg:FindFirstChild("Line3") :: TextLabel
-
-    line1.TextColor3 = color
-    line1.Text = string.format("%s  —  %s", m.Name, tostring(species))
-    line2.Text = string.format("State: %s   Dist: %.1f   Speed: %.1f", stateStr, dist, spd)
-    line3.Text = string.format("Prompt: %s   Owner: %s", promptStr, owner and tostring(owner) or "n/a")
+    return bb
 end
 
 local function forgetOverlay(m: Model)
     local bb = overlays[m]
-    if bb then
-        overlays[m] = nil
-        bb:Destroy()
-        lastPos[m] = nil
-        lastTime[m] = nil
-    end
+    if bb then bb:Destroy(); overlays[m] = nil end
 end
 
--- periodic scan
+local function speciesOf(m: Model): string
+    local s = getAttr(m, CONFIG.SPECIES_ATTR)
+    if type(s) == "string" and #s > 0 then return s end
+    for _, frag in ipairs(CONFIG.NAME_MATCH) do
+        if string.lower(m.Name):find(string.lower(frag)) then return frag end
+    end
+    return "Unknown"
+end
+
+-- ===== Main loop =====
 task.spawn(function()
-    local char = getChar()
-    local hrp = hrpOf(char) :: BasePart
+    local c = char()
+    local myRoot = rootOf(c) :: BasePart
 
     while true do
         task.wait(CONFIG.SCAN_INTERVAL)
+
         if not active then
-            -- hide all but keep them around
             for _, bb in pairs(overlays) do bb.Enabled = false end
             continue
         end
 
-        if not hrp or not hrp.Parent then
-            char = getChar()
-            hrp = hrpOf(char) :: BasePart
+        if not myRoot or not myRoot.Parent then
+            c = char(); myRoot = rootOf(c) :: BasePart
         end
-        local origin = hrp.Position
+        local origin = myRoot.Position
 
-        -- walk workspace once, filtered
         local seen: {[Model]: boolean} = {}
         for _, inst in ipairs(Workspace:GetDescendants()) do
             if inst:IsA("Model") and isHorseLike(inst) then
-                seen[inst] = true
-                displayFor(inst, origin)
+                local root = rootOf(inst)
+                if root then
+                    local dist = (root.Position - origin).Magnitude
+                    if dist <= CONFIG.MAX_RADIUS then
+                        local bb = ensureOverlay(inst); bb.Enabled = true
+                        local label = (bb:FindFirstChild("Text") :: TextLabel)
+                        label.Text = string.format("%s — %.1f", speciesOf(inst), math.min(dist, CONFIG.MAX_DISTANCE_ON_LABEL))
+                        seen[inst] = true
+                    end
+                end
             end
         end
 
-        -- cleanup stale
-        for m, _ in pairs(overlays) do
-            if not m.Parent or not seen[m] then
-                forgetOverlay(m)
-            end
+        for m in pairs(overlays) do
+            if not m.Parent or not seen[m] then forgetOverlay(m) end
         end
     end
 end)
 
--- toggle
+-- Toggle overlays
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.H then
         active = not active
         for _, bb in pairs(overlays) do bb.Enabled = active end
-        print(("[HorseOverlay] %s"):format(active and "ON" or "OFF"))
+        print(("[HorseMini] %s"):format(active and "ON" or "OFF"))
     end
 end)
