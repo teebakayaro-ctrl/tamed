@@ -1,34 +1,87 @@
--- Scan _replicationFolder for useful remotes
-
+-- ========= Ride / Seat Diagnostics =========
+local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 
-local function pathOf(i: Instance): string
-    local parts = {}
-    local cur = i
-    while cur and cur ~= game do
-        table.insert(parts, 1, cur.Name)
-        cur = cur.Parent
-    end
-    return table.concat(parts, ".")
+local LP = Players.LocalPlayer
+local function Char() return LP.Character or LP.CharacterAdded:Wait() end
+local function Hum() return Char():WaitForChild("Humanoid") end
+
+-- Heuristic: is this BasePart/Seat part of a horse?
+local HORSE_HINTS = { "horse", "stallion", "mare", "mount", "steed" } -- customize to your game
+local function looksLikeHorse(inst: Instance?)
+	if not inst then return false end
+	local model = inst:IsA("Model") and inst or inst:FindFirstAncestorOfClass("Model")
+	if not model then return false end
+	local nam = string.lower(model.Name)
+	for _, h in ipairs(HORSE_HINTS) do
+		if nam:find(h) then return true end
+	end
+	-- developers sometimes drop a BoolValue / StringValue tag on the horse
+	if model:FindFirstChild("HorseTag") or model:GetAttribute("IsHorse") then return true end
+	return false
 end
 
-local KEYWORDS = { "horse", "tame", "ride", "mount", "sell", "stable", "capture" }
-
-local function hasKeyword(s: string): boolean
-    local low = string.lower(s)
-    for _, k in ipairs(KEYWORDS) do
-        if low:find(k, 1, true) then return true end
-    end
-    return false
+local function getEquippedToolName()
+	for _, c in ipairs(Char():GetChildren()) do
+		if c:IsA("Tool") then return c.Name end
+	end
+	return nil
 end
 
-local folder = RS:FindFirstChild("_replicationFolder", true)
-if not folder then
-    warn("[Scan] _replicationFolder not found under ReplicatedStorage")
-else
-    print("=== scanning", pathOf(folder))
-    for _, d in ipairs(folder:GetDescendants()) do
-        print(("[%s] %s"):format(d.ClassName, pathOf(d)))
-    end
-    print("=== end scan ===")
+local function listPlayingAnims()
+	local anims = {}
+	local animator = Hum():FindFirstChildOfClass("Animator")
+	if animator then
+		for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
+			table.insert(anims, (tr.Animation and tr.Animation.Name) or tr.Name or "AnimationTrack")
+		end
+	end
+	return anims
 end
+
+-- one-shot snapshot you can print any time
+_G.PrintCharacterSnapshot = function()
+	local hum = Hum()
+	local state = hum:GetState()
+	local seat = hum.SeatPart
+	local onSeat = (hum.Sit and seat ~= nil)
+	local onHorseSeat = onSeat and looksLikeHorse(seat)
+
+	local equip = getEquippedToolName()
+	local attrs = {}
+	for _, a in ipairs(hum:GetAttributes()) do end -- just to touch, avoids lint
+	-- collect both Character and Humanoid attributes
+	for k, v in pairs(Char():GetAttributes()) do attrs["CHAR."..k] = v end
+	for k, v in pairs(hum:GetAttributes()) do attrs["HUM."..k] = v end
+
+	print("=== Character Snapshot ===")
+	print("State:", state.Name, " Sit:", hum.Sit)
+	print("SeatPart:", seat and seat:GetFullName() or "nil")
+	print("OnSeat:", onSeat, " OnHorseSeat:", onHorseSeat)
+	print("MoveDirection:", tostring(hum.MoveDirection))
+	print("WalkSpeed:", hum.WalkSpeed, "JumpPower:", hum.JumpPower)
+	print("EquippedTool:", equip or "none")
+	print("PlayingAnimations:", table.concat(listPlayingAnims(), ", "))
+	for k,v in pairs(attrs) do
+		print("Attr", k, "=", v)
+	end
+	print("==========================")
+end
+
+-- live logger for state changes + seat changes
+_G.StartRideStateLogger = function()
+	local hum = Hum()
+	print("[RideLogger] started")
+	hum.StateChanged:Connect(function(old, new)
+		print(("[RideLogger] State: %s -> %s"):format(old.Name, new.Name))
+	end)
+	hum:GetPropertyChangedSignal("SeatPart"):Connect(function()
+		local seat = hum.SeatPart
+		print("[RideLogger] SeatPart =", seat and seat:GetFullName() or "nil",
+		      " OnHorse=", looksLikeHorse(seat))
+	end)
+	hum:GetPropertyChangedSignal("Sit"):Connect(function()
+		print("[RideLogger] Sit =", hum.Sit)
+	end)
+end
+-- ========= End Diagnostics =========
