@@ -66,27 +66,4 @@ local function scan(root)
   end)
 end
 
-
--- ---------- optional client->server logging (only if allowed) ----------
-do
-  local ok, mt = pcall(getrawmetatable, game)
-  if ok and mt and mt.__namecall then
-    local old = mt.__namecall
-    pcall(function() setreadonly(mt,false) end)
-    mt.__namecall = function(self, ...)
-      local m = getnamecallmethod and getnamecallmethod() or ""
-      if (m=="FireServer" or m=="InvokeServer") and typeof(self)=="Instance"
-         and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-        print(("\n[Spy] %s -> %s"):format(m, self:GetFullName()))
-        dumpArgs({...})
-      end
-      return old(self, ...)
-    end
-    pcall(function() setreadonly(mt,true) end)
-    print("[Spy] __namecall hook active.")
-  else
-    print("[Spy] __namecall hook unavailable here (that’s fine, server->client logs still work).")
-  end
-end
-
 print("[SafeTameSpy] Ready. Do a normal tame and watch the console.")
