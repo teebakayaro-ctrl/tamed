@@ -2,6 +2,7 @@
 -- Put in StarterPlayerScripts. Logs remotes, lasso module calls, and client->server remote calls.
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
+local StarterPlayer = game:GetService("StarterPlayer")
 
 local LOG = {} -- ring buffer of events
 local MAX_LOG = 500
@@ -94,6 +95,7 @@ local function scanAndHookRemotes(root)
 end
 
 scanAndHookRemotes(RS)
+scanAndHookRemotes(StarterPlayer)
 local repFolder = RS:FindFirstChild("_replicationFolder")
 if repFolder then scanAndHookRemotes(repFolder) end
 
