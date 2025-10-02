@@ -1,140 +1,138 @@
--- === Equipment helpers & hotkeys ===
+-- === Targeted Tame Sender ===========================================
+-- call GetTamingHorses (RemoteEvent), then send chosen horse 'target'
+-- into likely tame/mount remotes with several payload shapes.
+
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local LP = Players.LocalPlayer
 
-local function myChar() return LP.Character or LP.CharacterAdded:Wait() end
-local function humanoid() local c=myChar(); return c:FindFirstChildOfClass("Humanoid") end
-local function backpack() return LP:FindFirstChildOfClass("Backpack") end
-
-local function toolsInBackpack(): {Tool}
-    local bp = backpack(); if not bp then return {} end
-    local out = {}
-    for _, inst in ipairs(bp:GetChildren()) do
-        if inst:IsA("Tool") then table.insert(out, inst) end
+-- helpers you already have in your script; keep if not present
+local function rootOf(m: Model): BasePart?
+    return m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m:FindFirstChildWhichIsA("BasePart")
+end
+local function isPlayerCharacter(m: Instance): boolean
+    return m:IsA("Model") and Players:GetPlayerFromCharacter(m) ~= nil
+end
+local function isHorseLike(m: Instance): boolean
+    if not m:IsA("Model") or isPlayerCharacter(m) then return false end
+    if not rootOf(m) then return false end
+    -- very loose check; replace with your own if you already have one
+    local n = m.Name:lower()
+    for _, frag in ipairs({ "horse","unicorn","gargoyle","equus","bisorse","pony","caprine","kelpie","peryton","fae","flora","clydesdale","kirin","hippocampus","saurequine","felorse","akhal","teke","cactaline","plush","cybred","celestial" }) do
+        if n:find(frag, 1, true) then return true end
     end
-    table.sort(out, function(a,b) return a.Name < b.Name end) -- deterministic order if game doesn't manage slots
+    return false
+end
+local function nearestHorse(from: Vector3): (Model?, BasePart?, number)
+    local bestM, bestR, bestD = nil, nil, math.huge
+    for _, inst in ipairs(workspace:GetDescendants()) do
+        if inst:IsA("Model") and isHorseLike(inst) then
+            local r = rootOf(inst)
+            if r then
+                local d = (r.Position - from).Magnitude
+                if d < bestD then bestD, bestM, bestR = d, inst, r end
+            end
+        end
+    end
+    return bestM, bestR, bestD
+end
+
+-- locate remotes
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local GetTamingHorsesRE = Remotes and Remotes:FindFirstChild("GetTamingHorses")  -- (RemoteEvent)
+-- collect all "tame/mount/ride" remotes anywhere under ReplicatedStorage (and common subfolders)
+local function collectTameRemotes(): {Instance}
+    local out = {}
+    local keywords = { "tame","starttame","mount","ride","begin" }
+    local roots = { ReplicatedStorage }
+    for _, root in ipairs(roots) do
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+                local n = d.Name:lower()
+                local hit = false
+                for _, k in ipairs(keywords) do
+                    if n:find(k, 1, true) then hit = true break end
+                end
+                if hit then table.insert(out, d) end
+            end
+        end
+    end
     return out
 end
 
-local function nthTool(n: number): Tool?
-    local list = toolsInBackpack()
-    return list[n]
+local function safeInvoke(remote: Instance, a, b)
+    local ok, res = pcall(function()
+        if remote:IsA("RemoteFunction") then
+            return remote:InvokeServer(a, b)
+        else
+            (remote :: RemoteEvent):FireServer(a, b)
+            return true
+        end
+    end)
+    return ok, res
 end
 
-local function equipTool(tool: Tool?)
-    local hum = humanoid()
-    if hum and tool then
-        hum:EquipTool(tool)
-        return true
+-- Send 'target' to all candidate remotes with multiple payload shapes
+local function sendTargetToTameRemotes(target: Model)
+    local candidates = collectTameRemotes()
+    if #candidates == 0 then
+        warn("[TameSender] no tame/mount remotes found under ReplicatedStorage (try scanning _replicationFolder / Workspace too)")
+        return false
     end
-    return false
-end
-
-local function unequipAll()
-    local hum = humanoid()
-    if hum then hum:UnequipTools() end
-end
-
-local function equippedTool(): Tool?
-    local c = myChar()
-    for _, inst in ipairs(c:GetChildren()) do
-        if inst:IsA("Tool") then return inst end
-    end
-    return nil
-end
-
-local function activateTool(t: Tool?)
-    t = t or equippedTool()
-    if t then
-        -- most tools (e.g., lassos) respond to :Activate()
-        pcall(function() t:Activate() end)
-        return true
-    end
-    return false
-end
-
-local function deactivateTool(t: Tool?)
-    t = t or equippedTool()
-    if t then
-        pcall(function() if t.Deactivate then t:Deactivate() end end)
-        return true
-    end
-    return false
-end
-
--- public helpers you can call from your tame flow:
-_G.EquipFirstSlot = function()
-    local t = nthTool(1)
-    if not t then warn("[Equip] no tool in slot 1 (first in Backpack)") return false end
-    return equipTool(t)
-end
-
-_G.UseSlot = function(n: number)
-    local t = nthTool(n)
-    if not t then warn("[UseSlot] no tool in slot", n) return false end
-    equipTool(t); task.wait()
-    return activateTool(t)
-end
-
-_G.UseToolNamed = function(name: string)
-    local bp = backpack(); if not bp then return false end
-    for _, inst in ipairs(bp:GetChildren()) do
-        if inst:IsA("Tool") and inst.Name == name then
-            equipTool(inst); task.wait()
-            return activateTool(inst)
+    local tried = 0
+    for _, r in ipairs(candidates) do
+        local name = r:GetFullName()
+        -- try a few payload shapes
+        local payloads = {
+            function() return target end,
+            function() return {horse = target} end,
+            function() return {target = target} end,
+            function() return {model = target} end,
+            function() return target, "tame" end,
+            function() return "tame", target end,
+        }
+        for i, build in ipairs(payloads) do
+            tried += 1
+            local a, b = build()
+            local ok, res = safeInvoke(r, a, b)
+            if ok then
+                print(("[TameSender] OK via %s (variant #%d)"):format(name, i))
+                return true
+            end
         end
     end
-    warn("[UseToolNamed] not found:", name); return false
+    warn(("[TameSender] all attempts failed on %d remotes × payloads"):format(#candidates))
+    return false
 end
 
--- optional: automatically prefer a lasso-like tool as "slot 1" if present
-local LASSO_HINTS = { "Lasso", "StringLasso", "TornLasso", "WesternLasso" }
-local function findPreferredTool(): Tool?
-    local bp = backpack(); if not bp then return nil end
-    for _, hint in ipairs(LASSO_HINTS) do
-        local t = bp:FindFirstChild(hint)
-        if t and t:IsA("Tool") then return t end
+-- Call GetTamingHorses properly (RemoteEvent) – optional “priming” step
+local function callGetTamingHorses()
+    if GetTamingHorsesRE and GetTamingHorsesRE:IsA("RemoteEvent") then
+        local ok = pcall(function() GetTamingHorsesRE:FireServer() end)
+        print("[TameSender] GetTamingHorses fired:", ok)
+    else
+        warn("[TameSender] GetTamingHorses RemoteEvent not found (or not an RE)")
     end
-    return nthTool(1)
 end
 
-_G.EquipPreferredTool = function()
-    local t = findPreferredTool()
-    return equipTool(t)
-end
-
--- === hotkeys ===
+-- Hotkeys:
+--   V = just call GetTamingHorses (prime)
+--   B = prime + choose nearest horse + send target to candidate remotes
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
-    -- Z: equip first slot (or preferred lasso)
-    if input.KeyCode == Enum.KeyCode.Z then
-        if not _G.EquipPreferredTool() then _G.EquipFirstSlot() end
-    -- X: activate/use current
-    elseif input.KeyCode == Enum.KeyCode.X then
-        activateTool()
-    -- C: deactivate
-    elseif input.KeyCode == Enum.KeyCode.C then
-        deactivateTool()
-    -- R: unequip
-    elseif input.KeyCode == Enum.KeyCode.R then
-        unequipAll()
-    -- Alt+1..8: equip slot N explicitly
-    elseif UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt) then
-        local map = {
-            [Enum.KeyCode.One]=1,[Enum.KeyCode.Two]=2,[Enum.KeyCode.Three]=3,[Enum.KeyCode.Four]=4,
-            [Enum.KeyCode.Five]=5,[Enum.KeyCode.Six]=6,[Enum.KeyCode.Seven]=7,[Enum.KeyCode.Eight]=8
-        }
-        local n = map[input.KeyCode]
-        if n then
-            local t = nthTool(n)
-            if t then equipTool(t) else warn("[Equip] no tool in slot", n) end
-        end
+    if input.KeyCode == Enum.KeyCode.V then
+        callGetTamingHorses()
+    elseif input.KeyCode == Enum.KeyCode.B then
+        callGetTamingHorses()
+        task.delay(0.1, function()
+            local c = LP.Character or LP.CharacterAdded:Wait()
+            local hrp = c:FindFirstChild("HumanoidRootPart")
+            if not hrp then warn("[TameSender] no HRP"); return end
+            local h, r, d = nearestHorse(hrp.Position)
+            if not h then warn("[TameSender] no horse found nearby"); return end
+            print(("[TameSender] target: %s (%.1f studs)"):format(h.Name, (r.Position - hrp.Position).Magnitude))
+            sendTargetToTameRemotes(h)
+        end)
     end
-end)
-
--- (optional) auto-equip preferred tool when you spawn
-LP.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    _G.EquipPreferredTool()
 end)
