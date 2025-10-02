@@ -370,202 +370,97 @@ buyBtn.MouseButton1Click:Connect(buyQueued)
 _G.TriggerLassoPurchase = function() buyQueued() end
 
 -- ===================== Tame Logic =====================
--- ====== REMOTE DISCOVERY ======
-local Remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-
-local TeleportRemote = Remotes and Remotes:FindFirstChild("TeleportRemote")
-local GetTamingHorsesRE = Remotes and Remotes:FindFirstChild("GetTamingHorses") -- RemoteEvent
-local RideRemote = (function()
-    if not Remotes then return nil end
-    for _, r in ipairs(Remotes:GetChildren()) do
-        local n = r.Name:lower()
-        if (n:find("ride") or n:find("mount")) and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
-            return r
-        end
-    end
-    return nil
-end)()
-
-local StartTameRemote = (function()
-    if not Remotes then return nil end
-    for _, r in ipairs(Remotes:GetChildren()) do
-        local n = r.Name:lower()
-        if (n:find("tame") or n:find("starttame") or n:find("begin")) and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
-            return r
-        end
-    end
-    return nil
-end)()
-
-local SellHorseRemote = (function()
-    if not Remotes then return nil end
-    for _, r in ipairs(Remotes:GetChildren()) do
-        local n = r.Name:lower()
-        if (n:find("sell") and n:find("horse")) and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
-            return r
-        end
-    end
-    return nil
-end)()
-
-local function safeInvoke(remote, a, b)
-    if not remote then return false, "no-remote" end
-    local ok, res = pcall(function()
-        if remote:IsA("RemoteFunction") then
-            return remote:InvokeServer(a, b)
-        else
-            remote:FireServer(a, b)
-            return true
-        end
-    end)
-    return ok, res
-end
-
--- ====== TELEPORT UTIL (try multiple payload shapes) ======
-local function teleportTo(pos: Vector3)
-    if TeleportRemote then
-        local tried = {
-            function() return pos end,                                  -- Vector3
-            function() return CFrame.new(pos) end,                      -- CFrame
-            function() return {Position = pos} end,                     -- table
-        }
-        for _, build in ipairs(tried) do
-            local a = build()
-            local ok = safeInvoke(TeleportRemote, a)
-            if ok then return true end
-        end
-    end
-    -- Fallback: client-set (might rubberband)
-    local hrp = (LP.Character and LP.Character:FindFirstChild("HumanoidRootPart"))
-    if hrp then
-        hrp.CFrame = CFrame.new(pos)
-        return true
-    end
-    return false
-end
-
--- ====== RIDE / TAME / SELL HELPERS ======
-local function setRideState(target: Model?)
-    if not target or not RideRemote then return end
-    -- try (target) or {horse=target}
-    safeInvoke(RideRemote, target)
-    safeInvoke(RideRemote, {horse = target})
-end
-
-local function startTame(target: Model?)
-    if not target then return end
-    -- press the proximity prompt too (UI method)
-    local prompt
-    for _, d in ipairs(target:GetDescendants()) do
-        if d:IsA("ProximityPrompt") then
-            local t = string.lower((d.ActionText or "") .. " " .. (d.ObjectText or ""))
-            if t:find("tame") or t:find("mount") or t:find("ride") then prompt = d break end
-        end
-    end
-    if prompt and prompt.Enabled then
-        local successVIM, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
-        if successVIM and VIM then
-            local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
-            VIM:SendKeyEvent(true, key, false, game); task.wait(0.05)
-            VIM:SendKeyEvent(false, key, false, game)
-        end
-    end
-    -- also try a server signal if present
-    if StartTameRemote then
-        safeInvoke(StartTameRemote, target)
-        safeInvoke(StartTameRemote, {horse = target})
-    end
-end
-
-local function sellHorse(target: Model?)
-    if not target or not SellHorseRemote then return end
-    local name = target:GetAttribute("NameKey") or target.Name
-    -- try common shapes: (model), (id/name), {horse=...}, {id=...}
-    safeInvoke(SellHorseRemote, target)
-    safeInvoke(SellHorseRemote, {horse = target})
-    safeInvoke(SellHorseRemote, tostring(name))
-    safeInvoke(SellHorseRemote, {id = tostring(name)})
-end
-
--- ====== OPTIONAL: Inspect GetTamingHorses via V key ======
-if GetTamingHorsesRE then
-    GetTamingHorsesRE.OnClientEvent:Connect(function(...)
-        print("[GetTamingHorses][OnClientEvent] payload:", ...)
-        -- If the server actually sends a list back, you can parse it here
-    end)
-end
-game:GetService("UserInputService").InputBegan:Connect(function(input, gpe)
-    if not gpe and input.KeyCode == Enum.KeyCode.V then
-        if GetTamingHorsesRE then
-            print("[V] Firing GetTamingHorses (RemoteEvent)")
-            safeInvoke(GetTamingHorsesRE) -- FireServer()
-        else
-            warn("[V] GetTamingHorses not found (as RemoteEvent)")
-        end
-    end
-end)
-
--- ====== TAME STATE ======
 local TAME_ACTIVE = false
 local TARGET: Model? = nil
 local TARGET_ROOT: BasePart? = nil
+local FOLLOW_RANGE = 18
+local REPTHRESH = 45
+
 local function setTameActive(v: boolean)
-    TAME_ACTIVE = v
-    tameToggle.Text = v and "ON" or "OFF"
-    tameToggle.BackgroundColor3 = v and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
-    tameStatus.Text = v and "Seeking nearest horse…" or "Paused."
-    if not v then
-        TARGET, TARGET_ROOT = nil, nil
-        local hrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
-        if hrp then hrp.Anchored = false end
-        tameTarget.Text = "Target: n/a"
+	TAME_ACTIVE = v
+	tameToggle.Text = v and "ON" or "OFF"
+	tameToggle.BackgroundColor3 = v and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
+	tameStatus.Text = v and "Seeking nearest horse…" or "Paused."
+	if not v then 
+        TARGET, TARGET_ROOT = nil, nil; 
+        tameTarget.Text = "Target: n/a";
+        local hrp = myRoot()
+        if hrp then
+            hrp.Anchored = false
+        end
     end
 end
 tameToggle.MouseButton1Click:Connect(function() setTameActive(not TAME_ACTIVE) end)
 
--- ====== PATCHED TAME LOOP ======
 task.spawn(function()
-    while true do
-        task.wait(0.25)
-        if not TAME_ACTIVE then continue end
+	local hum = char():WaitForChild("Humanoid") :: Humanoid
+	hum.AutoRotate = true; hum.WalkSpeed = 16
 
-        local hrp = (LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")) :: BasePart?
-        if not hrp then continue end
+	while true do
+		task.wait(0.25)
+		local hrp = myRoot(); if not hrp then continue end
 
-        -- target selection (keep your nearestHorse() elsewhere in script)
-        if (not TARGET) or (not TARGET.Parent) then
-            local _, r, d = nearestHorse(hrp.Position)
-            TARGET, TARGET_ROOT = _, r
-            if TARGET and TARGET_ROOT then
-                tameTarget.Text = string.format("Target: %s (%.1f)", speciesOf(TARGET), (TARGET_ROOT.Position - hrp.Position).Magnitude)
-                tameStatus.Text = "Target acquired."
+		if not TAME_ACTIVE then continue end
+
+		-- acquire target if needed
+		if (not TARGET) or (not TARGET.Parent) then
+			local t, tR, d = nil, nil, math.huge
+			if not t then t, tR, d = nearestHorse(hrp.Position) end
+			TARGET, TARGET_ROOT = t, tR
+			if TARGET and TARGET_ROOT then
+				tameTarget.Text = string.format("Target: %s (%.1f)", speciesOf(TARGET), (TARGET_ROOT.Position - hrp.Position).Magnitude)
+				tameStatus.Text = "Target acquired."
+			else
+				tameTarget.Text = "Target: n/a"; tameStatus.Text = "No horse found."
+			end
+		end
+
+		-- Instead of walking, teleport directly onto target
+        if TARGET and TARGET_ROOT then
+            local targetPos = TARGET_ROOT.Position + Vector3.new(0, -10, 0) -- slightly above back
+            -- Use TeleportRemote if available, else client-set CFrame
+            if TeleportRemote then
+                pcall(function()
+                    TeleportRemote:InvokeServer(targetPos)
+                end)
             else
-                tameTarget.Text = "Target: n/a"; tameStatus.Text = "No horse found."
+                local hrp = myRoot()
+                if hrp then hrp.CFrame = CFrame.new(targetPos) end
+            end
+            -- "Lock" yourself on the horse
+            local hrp = myRoot()
+            if hrp then
+                hrp.Anchored = true  -- pin your character
+            end
+
+            -- now spam the Tame/Mount prompt
+            local prompt = findTamePrompt(TARGET)
+            if prompt and prompt.Enabled then
+                local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
+                tapKey(key)
+                tameStatus.Text = "Trying to mount/tame…"
             end
         end
-        if not TARGET or not TARGET_ROOT then continue end
 
-        -- 1) make character "ride" (best-effort)
-        setRideState(TARGET)
+	end
+end)
 
-        -- 2) teleport on top of horse and lock
-        local mountPos = TARGET_ROOT.Position + Vector3.new(0, 2, 0)
-        teleportTo(mountPos)
-        if hrp then hrp.Anchored = true end
-
-        -- 3) start taming actively
-        startTame(TARGET)
-        tameStatus.Text = "Taming…"
-
-        -- 4) success check
-        local tamed = getAttr(TARGET, "Tamed")
-        local owner = getAttr(TARGET, "Owner") or getAttr(TARGET, "OwnerName")
-        if tamed == true or owner == LP.Name then
-            tameStatus.Text = "Tamed! Selling…"
-            if hrp then hrp.Anchored = false end
-            -- 5) sell
-            sellHorse(TARGET)
-            setTameActive(false)
+-- Debug: test GetTamingHorses with V
+UIS.InputBegan:Connect(function(input,gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.V then
+        if GetTamingHorses then
+            local ok, list = pcall(function() return GetTamingHorses:InvokeServer() end)
+            print("[Debug V] GetTamingHorses result:", ok, list)
+            if ok and typeof(list)=="table" then
+                for i, h in ipairs(list) do
+                    if typeof(h)=="Instance" then
+                        print("Horse", i, h.Name, "Attrs:", h:GetAttributes())
+                    end
+                end
+            end
+        else
+            warn("GetTamingHorses remote not found")
         end
     end
 end)
