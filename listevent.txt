@@ -54,11 +54,8 @@ local function scanCandidates(bruteforce: boolean): {Instance}
     local found = {}
     if bruteforce then
         for _, d in ipairs(game:GetDescendants()) do
-            if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-                if hasKeyword(d.Name) or hasKeyword(pathOf(d)) then
-                    table.insert(found, d)
-                end
-            end
+            table.insert(found, d)
+            
         end
         return found
     end
