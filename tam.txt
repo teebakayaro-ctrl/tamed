@@ -452,78 +452,48 @@ local function setTameActive(v: boolean)
 end
 tameToggle.MouseButton1Click:Connect(function() setTameActive(not TAME_ACTIVE) end)
 
--- locate remotes once
-local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
-local TeleportRemote: RemoteFunction? = Remotes and Remotes:FindFirstChild("TeleportRemote") :: RemoteFunction
-local GetTamingHorses: RemoteFunction? = Remotes and Remotes:FindFirstChild("GetTamingHorses") :: RemoteFunction
-
-local function getServerTameables(): {Model}
-    if not GetTamingHorses then return {} end
-    local ok, result = pcall(function() return GetTamingHorses:InvokeServer() end)
-    if ok and typeof(result) == "table" then
-        local horses = {}
-        for _, v in ipairs(result) do
-            if typeof(v) == "Instance" and v:IsA("Model") and isHorseLike(v) then
-                table.insert(horses, v)
-            end
-        end
-        return horses
-    end
-    return {}
-end
-
 task.spawn(function()
     while true do
         task.wait(0.25)
         if not TAME_ACTIVE then continue end
 
-        local hrp = rootOf(char())
-        if not hrp then continue end
+        local hrp = rootOf(char()); if not hrp then continue end
 
-        -- pick target
         if (not TARGET) or (not TARGET.Parent) then
-            local candidates = getServerTameables()
-            if #candidates > 0 then
-                TARGET = candidates[1] -- first from server list
-                TARGET_ROOT = rootOf(TARGET)
-            else
-                TARGET, TARGET_ROOT = nearestHorse(hrp.Position)
-            end
+            TARGET, TARGET_ROOT = nearestHorse(hrp.Position)
             if TARGET and TARGET_ROOT then
                 tameTarget.Text = string.format("Target: %s (%.1f)", speciesOf(TARGET), (TARGET_ROOT.Position - hrp.Position).Magnitude)
                 tameStatus.Text = "Target acquired."
             else
-                tameTarget.Text = "Target: n/a"
-                tameStatus.Text = "No horse found."
+                tameTarget.Text = "Target: n/a"; tameStatus.Text = "No horse found."
             end
         end
 
         if TARGET and TARGET_ROOT then
+            -- Teleport onto the horse (prefer server remote)
             local mountPos = TARGET_ROOT.Position + Vector3.new(0, 2, 0)
-
             if TeleportRemote then
-                pcall(function()
-                    TeleportRemote:InvokeServer(mountPos)
-                end)
+                pcall(function() (TeleportRemote :: RemoteFunction):InvokeServer(mountPos) end)
             else
                 hrp.CFrame = CFrame.new(mountPos)
             end
 
-            -- lock player
+            -- Lock in place while attempting tame
             hrp.Anchored = true
 
-            -- spam prompt
+            -- Try interacting with a Tame/Mount prompt
             local prompt = findTamePrompt(TARGET)
             if prompt and prompt.Enabled then
-                tapKey(prompt.KeyboardKeyCode or Enum.KeyCode.E)
+                local key = prompt.KeyboardKeyCode or Enum.KeyCode.E
+                tapKey(key)
                 tameStatus.Text = "Trying to tame…"
             else
                 tameStatus.Text = "Waiting for prompt…"
             end
 
-            -- check success
-            local tamed = getAttr(TARGET,"Tamed")
-            local owner = getAttr(TARGET,"Owner") or getAttr(TARGET,"OwnerName")
+            -- Success check
+            local tamed = getAttr(TARGET, "Tamed")
+            local owner = getAttr(TARGET, "Owner") or getAttr(TARGET, "OwnerName")
             if tamed == true or owner == LP.Name then
                 tameStatus.Text = "Tamed! Purchasing queue…"
                 if _G.TriggerLassoPurchase then _G.TriggerLassoPurchase() end
@@ -533,4 +503,3 @@ task.spawn(function()
         end
     end
 end)
-
