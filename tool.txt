@@ -1,0 +1,140 @@
+-- === Equipment helpers & hotkeys ===
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local LP = Players.LocalPlayer
+
+local function myChar() return LP.Character or LP.CharacterAdded:Wait() end
+local function humanoid() local c=myChar(); return c:FindFirstChildOfClass("Humanoid") end
+local function backpack() return LP:FindFirstChildOfClass("Backpack") end
+
+local function toolsInBackpack(): {Tool}
+    local bp = backpack(); if not bp then return {} end
+    local out = {}
+    for _, inst in ipairs(bp:GetChildren()) do
+        if inst:IsA("Tool") then table.insert(out, inst) end
+    end
+    table.sort(out, function(a,b) return a.Name < b.Name end) -- deterministic order if game doesn't manage slots
+    return out
+end
+
+local function nthTool(n: number): Tool?
+    local list = toolsInBackpack()
+    return list[n]
+end
+
+local function equipTool(tool: Tool?)
+    local hum = humanoid()
+    if hum and tool then
+        hum:EquipTool(tool)
+        return true
+    end
+    return false
+end
+
+local function unequipAll()
+    local hum = humanoid()
+    if hum then hum:UnequipTools() end
+end
+
+local function equippedTool(): Tool?
+    local c = myChar()
+    for _, inst in ipairs(c:GetChildren()) do
+        if inst:IsA("Tool") then return inst end
+    end
+    return nil
+end
+
+local function activateTool(t: Tool?)
+    t = t or equippedTool()
+    if t then
+        -- most tools (e.g., lassos) respond to :Activate()
+        pcall(function() t:Activate() end)
+        return true
+    end
+    return false
+end
+
+local function deactivateTool(t: Tool?)
+    t = t or equippedTool()
+    if t then
+        pcall(function() if t.Deactivate then t:Deactivate() end end)
+        return true
+    end
+    return false
+end
+
+-- public helpers you can call from your tame flow:
+_G.EquipFirstSlot = function()
+    local t = nthTool(1)
+    if not t then warn("[Equip] no tool in slot 1 (first in Backpack)") return false end
+    return equipTool(t)
+end
+
+_G.UseSlot = function(n: number)
+    local t = nthTool(n)
+    if not t then warn("[UseSlot] no tool in slot", n) return false end
+    equipTool(t); task.wait()
+    return activateTool(t)
+end
+
+_G.UseToolNamed = function(name: string)
+    local bp = backpack(); if not bp then return false end
+    for _, inst in ipairs(bp:GetChildren()) do
+        if inst:IsA("Tool") and inst.Name == name then
+            equipTool(inst); task.wait()
+            return activateTool(inst)
+        end
+    end
+    warn("[UseToolNamed] not found:", name); return false
+end
+
+-- optional: automatically prefer a lasso-like tool as "slot 1" if present
+local LASSO_HINTS = { "Lasso", "StringLasso", "TornLasso", "WesternLasso" }
+local function findPreferredTool(): Tool?
+    local bp = backpack(); if not bp then return nil end
+    for _, hint in ipairs(LASSO_HINTS) do
+        local t = bp:FindFirstChild(hint)
+        if t and t:IsA("Tool") then return t end
+    end
+    return nthTool(1)
+end
+
+_G.EquipPreferredTool = function()
+    local t = findPreferredTool()
+    return equipTool(t)
+end
+
+-- === hotkeys ===
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    -- Z: equip first slot (or preferred lasso)
+    if input.KeyCode == Enum.KeyCode.Z then
+        if not _G.EquipPreferredTool() then _G.EquipFirstSlot() end
+    -- X: activate/use current
+    elseif input.KeyCode == Enum.KeyCode.X then
+        activateTool()
+    -- C: deactivate
+    elseif input.KeyCode == Enum.KeyCode.C then
+        deactivateTool()
+    -- R: unequip
+    elseif input.KeyCode == Enum.KeyCode.R then
+        unequipAll()
+    -- Alt+1..8: equip slot N explicitly
+    elseif UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt) then
+        local map = {
+            [Enum.KeyCode.One]=1,[Enum.KeyCode.Two]=2,[Enum.KeyCode.Three]=3,[Enum.KeyCode.Four]=4,
+            [Enum.KeyCode.Five]=5,[Enum.KeyCode.Six]=6,[Enum.KeyCode.Seven]=7,[Enum.KeyCode.Eight]=8
+        }
+        local n = map[input.KeyCode]
+        if n then
+            local t = nthTool(n)
+            if t then equipTool(t) else warn("[Equip] no tool in slot", n) end
+        end
+    end
+end)
+
+-- (optional) auto-equip preferred tool when you spawn
+LP.CharacterAdded:Connect(function()
+    task.wait(0.5)
+    _G.EquipPreferredTool()
+end)
