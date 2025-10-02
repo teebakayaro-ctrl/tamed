@@ -458,3 +458,23 @@ task.spawn(function()
 
 	end
 end)
+
+-- Debug: test GetTamingHorses with V
+UIS.InputBegan:Connect(function(input,gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.V then
+        if GetTamingHorses then
+            local ok, list = pcall(function() return GetTamingHorses:InvokeServer() end)
+            print("[Debug V] GetTamingHorses result:", ok, list)
+            if ok and typeof(list)=="table" then
+                for i, h in ipairs(list) do
+                    if typeof(h)=="Instance" then
+                        print("Horse", i, h.Name, "Attrs:", h:GetAttributes())
+                    end
+                end
+            end
+        else
+            warn("GetTamingHorses remote not found")
+        end
+    end
+end)
