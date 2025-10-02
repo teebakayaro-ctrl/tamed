@@ -1,134 +1,57 @@
--- Remote Scanner (Horse) — finds candidate remotes beyond ReplicatedStorage
--- Hotkeys: K = scan, Shift+K = brute-force scan game, L = attach listeners to candidates
-
-local Players = game:GetService("Players")
+-- RemoteLogger.client.lua
 local RS = game:GetService("ReplicatedStorage")
-local RF = game:GetService("ReplicatedFirst")
-local WS = game:GetService("Workspace")
-local LG = game:GetService("Lighting")
-local LP = Players.LocalPlayer
+local SP = game:GetService("StarterPlayer")
+local SG = game:GetService("StarterGui")
 
-local KEYWORDS = { "horse", "tame", "ride", "mount", "sell", "stable", "capture", "lasso" }
-
-local SEARCH_BUCKETS = {
-    RS,
-    RF,
-    WS,
-    LG,
-    LP,                       -- Player root (has Backpack, PlayerGui, PlayerScripts)
-    LP:WaitForChild("PlayerGui"),
-    LP:WaitForChild("PlayerScripts"),
-    LP:WaitForChild("Backpack"),
-    function() return LP.Character or LP.CharacterAdded:Wait() end, -- live character (tools sometimes carry remotes)
+-- Folders to search
+local searchRoots = {
+	RS,
+	SP,
+	SG,
+	RS:FindFirstChild("_replicationFolder"),
 }
 
-local function pathOf(i: Instance): string
-    local parts = {}
-    local cur = i
-    while cur and cur ~= game do
-        table.insert(parts, 1, cur.Name)
-        cur = cur.Parent
-    end
-    return table.concat(parts, ".")
+-- Utility
+local function logRemote(r)
+	print(("[RemoteLogger] %s (%s)"):format(r:GetFullName(), r.ClassName))
+
+	-- Hook events to see traffic
+	if r:IsA("RemoteEvent") then
+		r.OnClientEvent:Connect(function(...)
+			print(("[RemoteLogger] OnClientEvent <- %s :"):format(r:GetFullName()), ...)
+		end)
+	elseif r:IsA("RemoteFunction") then
+		-- You can't hook InvokeServer calls directly,
+		-- but you can safely wrap InvokeClient (server->client).
+		r.OnClientInvoke = function(...)
+			print(("[RemoteLogger] OnClientInvoke <- %s :"):format(r:GetFullName()), ...)
+			-- return a dummy response so game won't error
+			return nil
+		end
+	end
 end
 
-local function hasKeyword(name: string): boolean
-    local n = string.lower(name)
-    for _, k in ipairs(KEYWORDS) do
-        if n:find(k, 1, true) then return true end
-    end
-    return false
+-- Scan all descendants
+for _, root in ipairs(searchRoots) do
+	if root then
+		for _, inst in ipairs(root:GetDescendants()) do
+			if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+				logRemote(inst)
+			end
+		end
+	end
 end
 
-local function collectFrom(container: Instance, out: {Instance})
-    for _, d in ipairs(container:GetDescendants()) do
-        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-            if hasKeyword(d.Name) or hasKeyword(pathOf(d)) then
-                table.insert(out, d)
-            end
-        end
-    end
+-- Also watch for new remotes that appear later
+for _, root in ipairs(searchRoots) do
+	if root then
+		root.DescendantAdded:Connect(function(inst)
+			if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+				print("[RemoteLogger] New remote added:", inst:GetFullName(), inst.ClassName)
+				logRemote(inst)
+			end
+		end)
+	end
 end
 
-local function scanCandidates(bruteforce: boolean): {Instance}
-    local found = {}
-    if bruteforce then
-        for _, d in ipairs(game:GetDescendants()) do
-            table.insert(found, d)
-            
-        end
-        return found
-    end
-    for _, bucket in ipairs(SEARCH_BUCKETS) do
-        local inst = typeof(bucket) == "function" and bucket() or bucket
-        if inst and inst.Parent then
-            collectFrom(inst, found)
-        end
-    end
-    -- also look for common custom folders by name anywhere under RS/WS
-    for _, root in ipairs({RS, WS}) do
-        for _, name in ipairs({"Remotes","Remote","Network","Net","Events","Signals","_replicationFolder","_communication","_remote"}) do
-            local f = root:FindFirstChild(name, true)
-            if f then collectFrom(f, found) end
-        end
-    end
-    return found
-end
-
-local function printList(list: {Instance})
-    if #list == 0 then
-        print("[RemoteScanner] No candidates found. Try Shift+K for brute-force scan.")
-        return
-    end
-    table.sort(list, function(a,b) return pathOf(a) < pathOf(b) end)
-    print(("=== Remote candidates (%d) ==="):format(#list))
-    for _, r in ipairs(list) do
-        print(("%s  %s"):format(r.ClassName, pathOf(r)))
-    end
-    print("=== end ===")
-end
-
-local hooked: {[Instance]: RBXScriptConnection} = {}
-local function hookListeners(list: {Instance})
-    for inst, conn in pairs(hooked) do
-        if conn.Connected then conn:Disconnect() end
-        hooked[inst] = nil
-    end
-    local count = 0
-    for _, r in ipairs(list) do
-        if r:IsA("RemoteEvent") then
-            local c = r.OnClientEvent:Connect(function(...)
-                local args = {...}
-                print("[OnClientEvent]", pathOf(r), "args#", #args)
-                for i, v in ipairs(args) do
-                    local tv = typeof(v)
-                    if tv == "Instance" then
-                        print(("  [%d] Instance %s (%s)"):format(i, v.Name, v.ClassName))
-                    elseif tv == "table" then
-                        print(("  [%d] table keys: %s"):format(i, table.concat((function(t) local k={} for kk,_ in pairs(t) do table.insert(k, tostring(kk)) end table.sort(k); return k end)(v), ", ")))
-                    else
-                        print(("  [%d] %s %s"):format(i, tv, tostring(v)))
-                    end
-                end
-            end)
-            hooked[r] = c
-            count += 1
-        end
-    end
-    print(("[RemoteScanner] Hooked %d RemoteEvent(s). Trigger something in-game to see payloads."):format(count))
-end
-
--- Hotkeys
-game:GetService("UserInputService").InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.K then
-        local bruteforce = game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.LeftShift) or game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.RightShift)
-        local list = scanCandidates(bruteforce)
-        printList(list)
-    elseif input.KeyCode == Enum.KeyCode.L then
-        local list = scanCandidates(false)
-        hookListeners(list)
-    end
-end)
-
-print("[RemoteScanner] Ready. Press K to scan (Shift+K = brute force), L to hook events.")
+print("[RemoteLogger] Ready, logging all remotes in ReplicatedStorage, StarterPlayer, StarterGui, and _replicationFolder")
