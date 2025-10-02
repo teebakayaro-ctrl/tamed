@@ -28,11 +28,7 @@ if not folder then
 else
     print("=== scanning", pathOf(folder))
     for _, d in ipairs(folder:GetDescendants()) do
-        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-            if hasKeyword(d.Name) or hasKeyword(pathOf(d)) then
-                print(("[%s] %s"):format(d.ClassName, pathOf(d)))
-            end
-        end
+        print(("[%s] %s"):format(d.ClassName, pathOf(d)))
     end
     print("=== end scan ===")
 end
