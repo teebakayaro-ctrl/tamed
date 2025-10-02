@@ -1,69 +1,48 @@
--- SafeTameSpy.client.lua
 local RS = game:GetService("ReplicatedStorage")
+local repFolder = RS:WaitForChild("_replicationFolder")
+local ok, Lasso = pcall(require, repFolder:WaitForChild("Lasso"))
 
--- ---------- pretty dump ----------
-local function fullName(i)
-  local t={}
-  while i do t[#t+1]=i.Name; i=i.Parent end
-  for l,r=1,#t//2 do t[l],t[#t-l+1]=t[#t-l+1],t[l] end
-  return table.concat(t,".")
+-- Pretty dumper for any value
+local function dump(val, depth, seen)
+	depth = depth or 0
+	seen = seen or {}
+	local t = typeof(val)
+	if t == "table" then
+		if seen[val] then return "{<cycle>}" end
+		seen[val] = true
+		local out = {"{\n"}
+		for k,v in pairs(val) do
+			table.insert(out, string.rep("  ", depth+1) .. "["..tostring(k).."] = " .. dump(v, depth+1, seen) .. "\n")
+		end
+		table.insert(out, string.rep("  ", depth).."}")
+		return table.concat(out)
+	elseif t == "Instance" then
+		return "Instance<"..val.ClassName..">:"..val:GetFullName()
+	else
+		return t.."("..tostring(val)..")"
+	end
 end
 
-local function dump(v, d, seen)
-  d, seen = d or 0, seen or {}
-  local pad = string.rep("  ", d)
-  local ty = typeof(v)
-  if ty=="table" then
-    if seen[v] then return pad.."{<cycle>}" end
-    seen[v]=true
-    local out={pad.."{\n"}
-    for k,val in pairs(v) do
-      out[#out+1]=pad.."  ["..tostring(k)..":"..typeof(k).."] = "..dump(val,d+1,seen).."\n"
-    end
-    out[#out+1]=pad.."}"
-    return table.concat(out)
-  elseif ty=="Instance" then
-    return pad.."Instance("..v.ClassName.."):"..fullName(v)
-  else
-    return pad..ty.."("..tostring(v)..")"
-  end
+local function safeWrap(tbl, fnName)
+	if type(tbl[fnName]) == "function" then
+		local old = tbl[fnName]
+		tbl[fnName] = function(...)
+			print("[Spy] "..fnName.." called:")
+			local args = {...}
+			for i,v in ipairs(args) do
+				print(" arg["..i.."] = "..dump(v))
+			end
+			return old(...)
+		end
+		print("[Spy] Wrapped "..fnName)
+	else
+		print("[Spy] "..fnName.." not a function, type="..typeof(tbl[fnName]))
+	end
 end
 
-local function dumpArgs(args)
-  for i,v in ipairs(args) do
-    print(("  arg[%d]: %s"):format(i, dump(v)))
-  end
+if ok and type(Lasso)=="table" then
+	safeWrap(Lasso, "_hit")
+	safeWrap(Lasso, "doLasso")
+else
+	warn("[Spy] Could not require Lasso module.")
 end
-
--- ---------- server->client remote logging ----------
-local function hookRemote(r)
-  if r:IsA("RemoteEvent") then
-    r.OnClientEvent:Connect(function(...)
-      print("\n[Spy] OnClientEvent <-", r:GetFullName())
-      dumpArgs({...})
-    end)
-  elseif r:IsA("RemoteFunction") then
-    r.OnClientInvoke = function(...)
-      print("\n[Spy] OnClientInvoke <-", r:GetFullName())
-      dumpArgs({...})
-      return nil
-    end
-  end
-end
-
-local function scan(root)
-  if not root then return end
-  for _,x in ipairs(root:GetDescendants()) do
-    if x:IsA("RemoteEvent") or x:IsA("RemoteFunction") then hookRemote(x) end
-  end
-  root.DescendantAdded:Connect(function(x)
-    if x:IsA("RemoteEvent") or x:IsA("RemoteFunction") then
-      print("[Spy] New remote:", x:GetFullName(), x.ClassName)
-      hookRemote(x)
-    end
-  end)
-end
-
-scan(RS)
-
-print("[SafeTameSpy] Ready. Do a normal tame and watch the console.")
