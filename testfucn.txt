@@ -1,136 +1,178 @@
--- Lasso Sentinel v3 — auto-(re)wrap doLasso/_hit even if the module reloads
--- Output: prints only when doLasso/_hit are called.
--- Stores: _G.LASSO_LASTARGS_doLasso, _G.LASSO_LASTRET_doLasso, _G.LASSO_LASTARGS__hit, _G.LASSO_LASTRET__hit
+-- HitCompact v1 — small, scoped logs for Lasso._hit + remotes fired inside it
+-- Shows: [_hit] a1=<table k:N> a2=<table k:N> a3=<Vector3>
+-- And selected fields: a1.Owner/Tool, a2.Model/HRP/Id if present
+-- Also logs remotes called DURING _hit that mention lasso/tame/horse/catch/rope
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
--- safe debug helpers
-local function dinfo(fn, what) local ok,a,b=pcall(debug.info,fn,what); if ok then return a,b end end
-local function full(i) local ok,f=pcall(function() return i:GetFullName() end); return ok and f or tostring(i) end
-local function pretty(v)
-  local t=typeof(v)
-  if t=="Instance" then local okn,nm=pcall(function() return v.Name end); return ("<%s:%s>"):format(v.ClassName, okn and nm or "?") end
-  local ok,s=pcall(function() return tostring(v) end); return ok and s or ("<"..t..">")
-end
-local function preview(p, cap) cap=cap or 6; local n=p.n or #p; local parts={}; for i=1,math.min(n,cap) do parts[i]=("["..i.."] "..pretty(p[i])) end; if n>cap then parts[#parts+1]=("...(+%d)"):format(n-cap) end; return table.concat(parts,"  ") end
+-- ---------- config ----------
+local KEY_A1 = {"Owner","Player","Character","Tool","Lasso","Weapon"}
+local KEY_A2 = {"Model","HumanoidRootPart","HRP","Target","Mob","Animal","Id","UID","Guid","Name"}
 
--- locate Lasso module
+local REMOTE_FILTER = { "lasso","tame","horse","catch","rope","doLasso","mount" } -- lower-case contains
+local PREVIEW_MAX = 4
+
+-- ---------- helpers ----------
+local function tolow(s) local ok,x=pcall(string.lower,s) return ok and x or tostring(s) end
+local function anyContains(s, list) if not s then return false end local L=tolow(s) for _,k in ipairs(list) do if L:find(k,1,true) then return true end end return false end
+local function full(i) local ok,f=pcall(function() return i:GetFullName() end) return ok and f or tostring(i) end
+local function brief(v)
+  local t=typeof(v)
+  if t=="Instance" then
+    local okN,nm=pcall(function() return v.Name end)
+    return string.format("<%s:%s>", v.ClassName, okN and nm or "?")
+  elseif t=="Vector3" or t=="CFrame" then
+    local s= tostring(v)
+    return (#s>80) and (s:sub(1,77).."...") or s
+  else
+    local ok,s=pcall(function() return tostring(v) end)
+    s = ok and s or ("<"..t..">")
+    return (#s>80) and (s:sub(1,77).."...") or s
+  end
+end
+local function kcount(t) local n=0 for _ in pairs(t) do n=n+1 end return n end
+local function showSomeKeys(tbl, keys, label)
+  if typeof(tbl)~="table" then return "" end
+  local parts={}
+  for _,k in ipairs(keys) do
+    local v = rawget(tbl, k)
+    if v ~= nil then parts[#parts+1]=string.format("%s=%s", k, brief(v)) end
+  end
+  if #parts>0 then
+    return string.format(" %s{%s}", label, table.concat(parts, ", "))
+  else
+    return ""
+  end
+end
+local function packPreview(p)
+  local n=p.n or #p
+  local parts={}
+  for i=1, math.min(n, PREVIEW_MAX) do parts[i]=brief(p[i]) end
+  if n>PREVIEW_MAX then parts[#parts+1]=("...(+%d)"):format(n-PREVIEW_MAX) end
+  return table.concat(parts, " | ")
+end
+
+-- ---------- find Lasso module ----------
 local root = ReplicatedStorage:FindFirstChild("_replicationFolder", true)
-if not root then return warn("[Lasso-Sentinel] _replicationFolder not found") end
+if not root then return warn("[HitCompact] _replicationFolder not found") end
 local lassoMS = root:FindFirstChild("Lasso", true)
-if not (lassoMS and lassoMS:IsA("ModuleScript")) then return warn("[Lasso-Sentinel] Lasso ModuleScript not found") end
+if not (lassoMS and lassoMS:IsA("ModuleScript")) then return warn("[HitCompact] Lasso ModuleScript not found") end
 local LASSO_SRC = full(lassoMS)
 
-local wrapped, owners, targetsByName = {}, {}, {}
+-- safe debug wrappers
+local function dinfo(fn,what) local ok,a,b=pcall(debug.info,fn,what) if ok then return a,b end end
+local function upcount(fn) local u=dinfo(fn,"u") if type(u)=="number" then return u end local i=1 while true do local ok,n=pcall(debug.getupvalue,fn,i) if not ok or n==nil then return i-1 end i=i+1 end end
+local function getup(fn,i) local ok,n,v=pcall(debug.getupvalue,fn,i) if ok then return n,v end end
 
-local function makeWrapper(label, fn)
-  return function(...)
-    local a=table.pack(...)
-    _G["LASSO_LASTARGS_"..label]=a
-    print(("["..label.."] args -> %s"):format(preview(a)))
-    local r=table.pack(fn(...))
-    _G["LASSO_LASTRET_"..label]=r
-    return table.unpack(r,1,r.n)
-  end
-end
-
-local function addOwner(targetFn, kind, owner, key)
-  owners[targetFn]=owners[targetFn] or {}
-  table.insert(owners[targetFn], {kind=kind, owner=owner, key=key})
-end
-
-local function scanUpvalues(fn)
-  -- get upvalue count (robust)
-  local u = dinfo(fn,"u"); if type(u)~="number" then
-    local i=1; while true do local ok,n=pcall(debug.getupvalue,fn,i); if not ok or n==nil then break end; i=i+1 end; u=i-1
-  end
-  for i=1,u do
-    local ok,nm,val = pcall(function() local n,v=debug.getupvalue(fn,i); return n,v end)
-    if ok and nm~=nil then
-      if typeof(val)=="function" then
-        local src = dinfo(val,"s") or ""
-        local name = dinfo(val,"n") or ""
-        if src:find(LASSO_SRC,1,true) and (name=="_hit" or name=="doLasso") then
-          targetsByName[name]=val; addOwner(val,"upvalue",fn,i)
-        end
-      elseif typeof(val)=="table" then
-        for k,vv in pairs(val) do
-          if typeof(vv)=="function" then
-            local src = dinfo(vv,"s") or ""; local name=dinfo(vv,"n") or ""
-            if src:find(LASSO_SRC,1,true) and (name=="_hit" or name=="doLasso") then
-              targetsByName[name]=vv; addOwner(vv,"table",val,k)
-            end
-          end
-        end
-      end
-    end
-  end
-end
-
-local function wrapFnIfTarget(fn)
-  if wrapped[fn] then return end
-  local name = dinfo(fn,"n") or ""
-  if name=="_hit" or name=="doLasso" then
-    local wrapper = makeWrapper(name, fn)
-    -- prefer hookfunction if available
-    if type(hookfunction)=="function" then pcall(hookfunction, fn, wrapper) end
-    -- patch recorded owners too
-    if owners[fn] then
-      for _,ref in ipairs(owners[fn]) do
-        if ref.kind=="upvalue" and typeof(ref.owner)=="function" then pcall(debug.setupvalue, ref.owner, ref.key, wrapper) end
-        if ref.kind=="table"   and typeof(ref.owner)=="table"   then pcall(function() ref.owner[ref.key]=wrapper end) end
-      end
-    end
-    wrapped[fn]=true
-    print("[Lasso-Sentinel] wrapped "..name)
-  end
-end
-
-local function sweep()
-  owners, targetsByName = {}, {}
-  -- try getgc for best coverage
-  local usedGc = false
+-- ---------- find _hit closure (again, resilient) ----------
+local hitFn
+local function seekHit()
+  hitFn=nil
   if type(getgc)=="function" then
-    usedGc = true
-    for _,obj in ipairs(getgc(true)) do
-      if typeof(obj)=="function" then
-        local src = dinfo(obj,"s") or ""
-        if src:find(LASSO_SRC,1,true) then
-          local nm = dinfo(obj,"n") or ""
-          if nm=="_hit" or nm=="doLasso" then targetsByName[nm]=obj end
-          scanUpvalues(obj)
-        end
+    for _,o in ipairs(getgc(true)) do
+      if typeof(o)=="function" then
+        local src=dinfo(o,"s") or ""
+        local nm =dinfo(o,"n") or ""
+        if src:find(LASSO_SRC,1,true) and nm=="_hit" then hitFn=o break end
       end
     end
   end
-  -- fallback: crawl from require(Lasso)
-  if not usedGc then
+  if not hitFn then
     local ok,L = pcall(require, lassoMS)
     if ok then
-      local q, seenT = {L}, {}
-      while #q>0 do
-        local v = table.remove(q)
-        local t = typeof(v)
+      local seenF,seenT={},{}
+      local function crawl(v)
+        local t=typeof(v)
         if t=="function" then
-          local src = dinfo(v,"s") or ""
-          if src:find(LASSO_SRC,1,true) then
-            local nm = dinfo(v,"n") or ""
-            if nm=="_hit" or nm=="doLasso" then targetsByName[nm]=v end
-            scanUpvalues(v)
-          end
-        elseif t=="table" and not seenT[v] then
-          seenT[v]=true; for _,vv in pairs(v) do table.insert(q,vv) end
+          if seenF[v] then return end; seenF[v]=true
+          local src=dinfo(v,"s") or ""
+          local nm =dinfo(v,"n") or ""
+          if src:find(LASSO_SRC,1,true) and nm=="_hit" then hitFn=v return end
+          local u=upcount(v)
+          for i=1,u do local _,uv=getup(v,i); if uv~=nil then crawl(uv) end end
+        elseif t=="table" then
+          if seenT[v] then return end; seenT[v]=true
+          for _,vv in pairs(v) do crawl(vv) end
+        end
+      end
+      crawl(L)
+    end
+  end
+  return hitFn
+end
+
+-- ---------- tiny remote logger ONLY during _hit ----------
+local hookInstalled=false
+local inHit=false
+local oldNamecall=nil
+local function ensureRemoteGuard()
+  if hookInstalled or type(hookmetamethod)~="function" then return end
+  oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+    local m = (type(getnamecallmethod)=="function" and getnamecallmethod()) or ""
+    if inHit and (m=="FireServer" or m=="InvokeServer" or m=="FireClient" or m=="InvokeClient" or m=="FireAllClients") then
+      local path = (typeof(self)=="Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or tostring(self)
+      if anyContains(path, REMOTE_FILTER) or anyContains(self.Name, REMOTE_FILTER) then
+        local p = table.pack(...)
+        print(string.format("[_hit>remote] %s %s  args=[%s]", m, path, packPreview(p)))
+      end
+    end
+    return oldNamecall(self, ...)
+  end)
+  hookInstalled = (type(oldNamecall)=="function")
+  if hookInstalled then print("[HitCompact] remote guard installed.") end
+end
+
+-- ---------- (re)wrap _hit ----------
+local function wrapHit()
+  local fn = seekHit()
+  if not fn then print("[HitCompact] _hit not found yet. Throw once, then re-run.") return end
+  if _G.__HitCompact_wrapped == fn then print("[HitCompact] _hit already wrapped.") return end
+
+  ensureRemoteGuard()
+
+  local orig = fn
+  local wrapper = function(a1,a2,a3,...)
+    -- 1-line header
+    local t1,t2,t3 = typeof(a1), typeof(a2), typeof(a3)
+    local k1 = (t1=="table") and kcount(a1) or 0
+    local k2 = (t2=="table") and kcount(a2) or 0
+    print(string.format("[_hit] a1=<%s k:%d>%s  a2=<%s k:%d>%s  a3=%s",
+      t1, k1, showSomeKeys(a1, KEY_A1, "a1"),
+      t2, k2, showSomeKeys(a2, KEY_A2, "a2"),
+      brief(a3)
+    ))
+
+    -- store last args (compact)
+    _G.LASSO_LASTARGS__hit = table.pack(a1,a2,a3,...)
+
+    -- turn on inner remote capture for this call
+    inHit = true
+    local r = table.pack(orig(a1,a2,a3,...))
+    inHit = false
+
+    _G.LASSO_LASTRET__hit = r
+    return table.unpack(r,1,r.n)
+  end
+
+  if type(hookfunction)=="function" then
+    local ok = pcall(hookfunction, fn, wrapper)
+    if ok then _G.__HitCompact_wrapped = fn; print("[HitCompact] _hit wrapped via hookfunction.") return end
+  end
+
+  -- fallback: best-effort upvalue swap (scan likely owners)
+  if type(getgc)=="function" then
+    for _,o in ipairs(getgc(true)) do
+      if typeof(o)=="function" then
+        local u=upcount(o)
+        for i=1,u do
+          local n,uv = getup(o,i)
+          if uv==fn then pcall(debug.setupvalue, o, i, wrapper) end
         end
       end
     end
   end
-  for _,fn in pairs(targetsByName) do wrapFnIfTarget(fn) end
+  _G.__HitCompact_wrapped = fn
+  print("[HitCompact] _hit wrapped (upvalue patch).")
 end
 
--- run now and keep re-sweeping
-sweep()
-task.spawn(function()
-  while true do task.wait(1.0); sweep() end
-end)
-
-print("[Lasso-Sentinel] running. Play normally; when _hit/doLasso fire you'll see their exact args printed.")
+wrapHit()  -- do it now
