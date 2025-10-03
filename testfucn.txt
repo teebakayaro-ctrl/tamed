@@ -1,287 +1,172 @@
--- GLOBAL TAMING SPY v1.0
--- Logs RemoteEvent/RemoteFunction Fire*/Invoke*, BindableEvent/BindableFunction calls, and Tool.Activated
--- Stores logs in _G.TAMING_SPY_LOGS (newest first). Use TamingSpyGetLogs(n) to fetch.
+-- GLOBAL REMOTE SPY v1.2-mini (no bindables; nil-safe)
+-- Logs ALL RemoteEvent/RemoteFunction Fire*/Invoke* calls across the game.
+-- Stores recent logs in _G.REMOTE_SPY_LOGS. Helpers: RemoteSpyGet(n), RemoteSpyFilter(substr,n), RemoteSpyClear().
 
-local RunService = game:GetService("RunService")
-local HttpService = pcall(function() return game:GetService("HttpService") end) and game:GetService("HttpService") or nil
+local MAX_LOGS = 1000
+local PREVIEW_MAX = 6
 
--- CONFIG (edit)
-local MAX_LOGS = 1000               -- keep this many recent entries
-local PREVIEW_ARG_LIMIT = 6         -- how many args to preview
-local CAPTURE_BINDABLES = true
-local CAPTURE_TOOL_ACTIVATED = true
+-- ---- compat shims ----
+local has_hook = (type(hookmetamethod) == "function")
+local has_getname = (type(getnamecallmethod) == "function")
+local has_check = (type(checkcaller) == "function")
+local getNC = has_getname and getnamecallmethod or function() return "" end
+local isCaller = has_check and checkcaller or function() return false end
 
--- compatibility shims
-local has = {
-    hookmetamethod = type(hookmetamethod) == "function",
-    getnamecallmethod = type(getnamecallmethod) == "function",
-    checkcaller = type(checkcaller) == "function",
-    newcclosure = type(newcclosure) == "function",
-    getrawmetatable = pcall(getrawmetatable, game),
-    setreadonly = type(setreadonly) == "function",
-}
-local getNC = has.getnamecallmethod and getnamecallmethod or function() return "" end
-local isCaller = has.checkcaller and checkcaller or function() return false end
+_G.REMOTE_SPY_LOGS = _G.REMOTE_SPY_LOGS or {}
 
--- safe tostring/preview
+local function pushLog(e)
+    table.insert(_G.REMOTE_SPY_LOGS, 1, e)
+    if #_G.REMOTE_SPY_LOGS > MAX_LOGS then
+        for i = MAX_LOGS+1, #_G.REMOTE_SPY_LOGS do _G.REMOTE_SPY_LOGS[i] = nil end
+    end
+end
+
 local function safeToStr(v)
     local t = typeof(v)
     if t == "Instance" then
-        local ok, fullname = pcall(function() return v:GetFullName() end)
-        if ok then return ("<%s:%s>"):format(v.ClassName, fullname) end
-        return ("<%s>"):format(v.ClassName)
-    elseif t == "table" then
-        if HttpService then
-            local ok, enc = pcall(function() return HttpService:JSONEncode(v) end)
-            if ok then return enc end
-        end
-        return tostring(v)
-    else
-        -- primitive pretty
-        local ok, s = pcall(function() return tostring(v) end)
-        return ok and s or ("<unprintable:%s>"):format(t)
+        local ok, full = pcall(function() return v:GetFullName() end)
+        return ok and ("<%s:%s>"):format(v.ClassName, full) or ("<%s>" ):format(v.ClassName)
     end
+    local ok, s = pcall(function() return tostring(v) end)
+    return ok and s or ("<unprintable:%s>"):format(t)
 end
 
-local function argsPreviewFromPack(pack)
+local function previewFromPack(p)
+    local n = p.n or #p
     local parts = {}
-    for i = 1, math.min(pack.n or #pack, PREVIEW_ARG_LIMIT) do
-        parts[#parts+1] = safeToStr(pack[i])
-    end
-    if (pack.n or #pack) > PREVIEW_ARG_LIMIT then
-        parts[#parts+1] = ("...(+%d)"):format((pack.n or #pack) - PREVIEW_ARG_LIMIT)
-    end
+    local cap = math.min(n, PREVIEW_MAX)
+    for i = 1, cap do parts[i] = safeToStr(p[i]) end
+    if n > PREVIEW_MAX then parts[#parts+1] = ("...(+%d)"):format(n - PREVIEW_MAX) end
     return table.concat(parts, ", ")
 end
 
-local function captureShortStack()
+local function shortStack()
     local ok, tb = pcall(function() return debug.traceback("", 3) end)
     if not ok or not tb then return "" end
-    -- take first ~6 lines to keep compact
-    local lines = {}
+    local k, out = 0, {}
     for line in tb:gmatch("[^\n]+") do
-        lines[#lines+1] = line
-        if #lines >= 6 then break end
+        k = k + 1; out[#out+1] = line
+        if k >= 5 then break end
     end
-    return table.concat(lines, " | ")
+    return table.concat(out, " | ")
 end
 
--- log buffer
-_G.TAMING_SPY_LOGS = _G.TAMING_SPY_LOGS or {}
-local function pushLog(entry)
-    table.insert(_G.TAMING_SPY_LOGS, 1, entry)
-    if #_G.TAMING_SPY_LOGS > MAX_LOGS then
-        for i = MAX_LOGS+1, #_G.TAMING_SPY_LOGS do _G.TAMING_SPY_LOGS[i] = nil end
-    end
-end
-
--- quick printer
-local function shortPrint(e)
-    local ts = os.date("%H:%M:%S", e.time or os.time())
-    print(("[TAMING-SPY][%s] %s -> %s | args=[%s] %s"):format(
-        ts, e.receiver or "Unknown", e.method or "?", e.argsPreview or "", e.note or ""
-    ))
-end
-
--- === hook __namecall (preferred with hookmetamethod) ===
+-- ---- hook via hookmetamethod (preferred) ----
 local hooked = false
-if has.hookmetamethod then
-    local old = nil
-    old = hookmetamethod(game, "__namecall", function(self, ...)
-        local method = getNC()
-        if method and (method == "FireServer" or method == "FireClient" or method == "FireAllClients"
-            or method == "InvokeServer" or method == "InvokeClient") then
-
+if has_hook then
+    local original = hookmetamethod(game, "__namecall", function(self, ...)
+        local m = getNC()
+        if m == "FireServer" or m == "FireClient" or m == "FireAllClients" or m == "InvokeServer" or m == "InvokeClient" then
             local pack = table.pack(...)
             local entry = {
                 time = os.time(),
-                method = method,
-                receiver = (type(self) == "Instance" and pcall(function() return self:GetFullName() end) and self:GetFullName()) or tostring(self),
-                class = (type(self) == "Instance" and self.ClassName) or typeof(self),
-                argsPreview = argsPreviewFromPack(pack),
+                method = m,
+                receiver = (typeof(self) == "Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or tostring(self),
+                class = (typeof(self) == "Instance" and self.ClassName) or typeof(self),
+                argsPreview = previewFromPack(pack),
                 originIsScript = isCaller(),
-                callerStack = captureShortStack(),
+                stack = shortStack(),
             }
 
-            if method:sub(1,6) == "Invoke" then
-                local ok, r1, r2, r3 = pcall(old, self, ...)
+            if m:sub(1,6) == "Invoke" then
+                local ok, r1, r2, r3 = pcall(original, self, ...)
                 entry.invokeSuccess = ok
-                if ok then entry.returnsPreview = argsPreviewFromPack(table.pack(r1, r2, r3)) end
+                if ok then entry.returnsPreview = previewFromPack(table.pack(r1, r2, r3)) end
                 pushLog(entry)
-                shortPrint(entry)
+                print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s | ret=[%s]"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok), entry.returnsPreview or ""))
                 if ok then return r1, r2, r3 else error(tostring(r1)) end
             else
-                local ok, err = pcall(old, self, ...)
+                local ok, err = pcall(original, self, ...)
                 entry.fireSuccess = ok
                 if not ok then entry.error = tostring(err) end
                 pushLog(entry)
-                shortPrint(entry)
+                print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok)))
                 return
             end
         end
-        return old(self, ...)
+        return original(self, ...)
     end)
-    hooked = true
+
+    -- some executors return nil instead of the original (bad!); guard that:
+    if type(original) == "function" then
+        hooked = true
+    else
+        warn("[REMOTE-SPY] hookmetamethod returned nil; disabling this path.")
+    end
 end
 
--- === raw metatable fallback ===
-if not hooked and has.getrawmetatable then
-    local ok, mt = pcall(getrawmetatable, game)
-    if ok and mt and type(mt.__namecall) == "function" then
-        local oldNamecall = mt.__namecall
-        if has.setreadonly then pcall(setreadonly, mt, false) end
-        mt.__namecall = (has.newcclosure and newcclosure or function(f) return f end)(function(self, ...)
-            local method = getNC()
-            if method and (method == "FireServer" or method == "FireClient" or method == "FireAllClients"
-                or method == "InvokeServer" or method == "InvokeClient") then
-
+-- ---- raw metatable fallback (only if safe) ----
+if not hooked then
+    local ok_mt, mt = pcall(getrawmetatable, game)
+    if ok_mt and mt and type(mt.__namecall) == "function" then
+        local old = mt.__namecall
+        local canWrite = (type(setreadonly) == "function")
+        if canWrite then pcall(setreadonly, mt, false) end
+        mt.__namecall = (type(newcclosure) == "function" and newcclosure or function(f) return f end)(function(self, ...)
+            local m = getNC()
+            if m == "FireServer" or m == "FireClient" or m == "FireAllClients" or m == "InvokeServer" or m == "InvokeClient" then
                 local pack = table.pack(...)
                 local entry = {
                     time = os.time(),
-                    method = method,
-                    receiver = (type(self) == "Instance" and pcall(function() return self:GetFullName() end) and self:GetFullName()) or tostring(self),
-                    class = (type(self) == "Instance" and self.ClassName) or typeof(self),
-                    argsPreview = argsPreviewFromPack(pack),
+                    method = m,
+                    receiver = (typeof(self) == "Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or tostring(self),
+                    class = (typeof(self) == "Instance" and self.ClassName) or typeof(self),
+                    argsPreview = previewFromPack(pack),
                     originIsScript = isCaller(),
-                    callerStack = captureShortStack(),
+                    stack = shortStack(),
                 }
-
-                if method:sub(1,6) == "Invoke" then
-                    local ok2, r1, r2, r3 = pcall(oldNamecall, self, ...)
+                if m:sub(1,6) == "Invoke" then
+                    local ok2, r1, r2, r3 = pcall(old, self, ...)
                     entry.invokeSuccess = ok2
-                    if ok2 then entry.returnsPreview = argsPreviewFromPack(table.pack(r1, r2, r3)) end
+                    if ok2 then entry.returnsPreview = previewFromPack(table.pack(r1, r2, r3)) end
                     pushLog(entry)
-                    shortPrint(entry)
+                    print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s | ret=[%s]"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok2), entry.returnsPreview or ""))
                     if ok2 then return r1, r2, r3 else error(tostring(r1)) end
                 else
-                    local ok2, err = pcall(oldNamecall, self, ...)
+                    local ok2, err = pcall(old, self, ...)
                     entry.fireSuccess = ok2
                     if not ok2 then entry.error = tostring(err) end
                     pushLog(entry)
-                    shortPrint(entry)
+                    print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok2)))
                     return
                 end
             end
-            return oldNamecall(self, ...)
+            return old(self, ...)
         end)
-        if has.setreadonly then pcall(setreadonly, mt, true) end
+        if canWrite then pcall(setreadonly, mt, true) end
         hooked = true
     end
 end
 
 if not hooked then
-    warn("[TAMING-SPY] Could not hook __namecall. Your executor may not support hookmetamethod or raw mt.")
+    warn("[REMOTE-SPY] Could not hook __namecall (no working hookmetamethod and raw __namecall unavailable). Your executor likely doesn’t support call interception.")
 else
-    print("[TAMING-SPY] __namecall hooked. Logging RemoteEvent/RemoteFunction calls.")
+    print("[REMOTE-SPY] Active. Logging RemoteEvent/RemoteFunction Fire*/Invoke* across game.")
 end
 
--- === optional: capture BindableEvent/BindableFunction calls by wrapping :Fire/Invoke on existing bindables ===
-if CAPTURE_BINDABLES then
-    local function wrapBindable(b)
-        if not b or not b:IsA then return end
-        if b._taming_spy_wrapped then return end
-        b._taming_spy_wrapped = true
-        if b:IsA("BindableEvent") then
-            local orig = b.Fire
-            b.Fire = function(self, ...)
-                local pack = table.pack(...)
-                local entry = {
-                    time = os.time(),
-                    method = "BindableEvent.Fire",
-                    receiver = pcall(function() return self:GetFullName() end) and self:GetFullName() or tostring(self),
-                    class = self.ClassName,
-                    argsPreview = argsPreviewFromPack(pack),
-                    callerStack = captureShortStack(),
-                }
-                pushLog(entry); shortPrint(entry)
-                return orig(self, ...)
-            end
-        elseif b:IsA("BindableFunction") then
-            local orig = b.Invoke
-            b.Invoke = function(self, ...)
-                local pack = table.pack(...)
-                local entry = {
-                    time = os.time(),
-                    method = "BindableFunction.Invoke",
-                    receiver = pcall(function() return self:GetFullName() end) and self:GetFullName() or tostring(self),
-                    class = self.ClassName,
-                    argsPreview = argsPreviewFromPack(pack),
-                    callerStack = captureShortStack(),
-                }
-                local ok, r1, r2 = pcall(orig, self, ...)
-                entry.invokeSuccess = ok
-                if ok then entry.returnsPreview = argsPreviewFromPack(table.pack(r1, r2)) end
-                pushLog(entry); shortPrint(entry)
-                if ok then return r1, r2 else error(tostring(r1)) end
-            end
-        end
-    end
-
-    -- wrap existing bindables in game
-    for _, b in ipairs(game:GetDescendants()) do
-        if b:IsA("BindableEvent") or b:IsA("BindableFunction") then wrapBindable(b) end
-    end
-    -- watch for future bindables
-    game.DescendantAdded:Connect(function(d)
-        if d:IsA("BindableEvent") or d:IsA("BindableFunction") then wrapBindable(d) end
-    end)
-    print("[TAMING-SPY] Bindable capture active.")
-end
-
--- === optional: capture Tool.Activated ===
-if CAPTURE_TOOL_ACTIVATED then
-    local function trackTool(tool)
-        if not tool or not tool:IsA or not tool:IsA("Tool") then return end
-        if tool._taming_spy_toolwrapped then return end
-        tool._taming_spy_toolwrapped = true
-        tool.Activated:Connect(function()
-            local entry = {
-                time = os.time(),
-                method = "Tool.Activated",
-                receiver = pcall(function() return tool:GetFullName() end) and tool:GetFullName() or tostring(tool),
-                class = "Tool",
-                argsPreview = "",
-                callerStack = captureShortStack(),
-            }
-            pushLog(entry); shortPrint(entry)
-        end)
-    end
-
-    -- wrap current tools in workspace / players etc.
-    for _, d in ipairs(game:GetDescendants()) do
-        if d:IsA("Tool") then trackTool(d) end
-    end
-    game.DescendantAdded:Connect(function(d)
-        if d:IsA("Tool") then trackTool(d) end
-    end)
-    print("[TAMING-SPY] Tool.Activated capture active.")
-end
-
--- === utilities exposed to executor console ===
-_G.TamingSpyGetLogs = function(n)
+-- ---- helpers ----
+_G.RemoteSpyGet = function(n)
     n = n or 50
     local out = {}
-    for i=1, math.min(n, #_G.TAMING_SPY_LOGS) do out[i] = _G.TAMING_SPY_LOGS[i] end
+    for i=1, math.min(n, #_G.REMOTE_SPY_LOGS) do out[i] = _G.REMOTE_SPY_LOGS[i] end
     return out
 end
-
-_G.TamingSpyClear = function()
-    _G.TAMING_SPY_LOGS = {}
-    print("[TAMING-SPY] cleared.")
-end
-
-_G.TamingSpyFilter = function(substr, n)
+_G.RemoteSpyFilter = function(substr, n)
     n = n or 100
-    local results = {}
-    for i=1, #_G.TAMING_SPY_LOGS do
-        local e = _G.TAMING_SPY_LOGS[i]
-        if e and ((e.receiver and tostring(e.receiver):find(substr, 1, true)) or (e.method and tostring(e.method):find(substr, 1, true))) then
-            table.insert(results, e)
-            if #results >= n then break end
+    local res = {}
+    for i=1, #_G.REMOTE_SPY_LOGS do
+        local e = _G.REMOTE_SPY_LOGS[i]
+        if e and (
+            (e.receiver and tostring(e.receiver):find(substr, 1, true)) or
+            (e.method and tostring(e.method):find(substr, 1, true))
+        ) then
+            res[#res+1] = e
+            if #res >= n then break end
         end
     end
-    return results
+    return res
 end
-
-print("[TAMING-SPY] Ready. Use TamingSpyGetLogs(n), TamingSpyClear(), TamingSpyFilter(substr,n).")
-print("[TAMING-SPY] Warning: this is noisy. Use TamingSpyFilter('Lasso' or 'Tame' or 'Horse') to narrow results.")
+_G.RemoteSpyClear = function()
+    _G.REMOTE_SPY_LOGS = {}
+    print("[REMOTE-SPY] cleared.")
+end
