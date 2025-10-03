@@ -45,7 +45,7 @@ do
 
             local args = {...}
             print(("\n[Outbound] %s -> %s"):format(m, self:GetFullName()))
-            print("   Args: "..summarizeArgs(args))
+            print("   Args: "..(args))
         end
         return old(self, ...)
     end
