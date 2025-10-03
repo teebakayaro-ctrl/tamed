@@ -1,48 +1,58 @@
+-- TrimmedRemoteSpy.client.lua
+-- Put into StarterPlayerScripts
+
 local RS = game:GetService("ReplicatedStorage")
-local repFolder = RS:WaitForChild("_replicationFolder")
-local ok, Lasso = pcall(require, repFolder:WaitForChild("Lasso"))
 
--- Pretty dumper for any value
-local function dump(val, depth, seen)
+-- helper to summarize any value without huge spam
+local function summarize(v, depth)
 	depth = depth or 0
-	seen = seen or {}
-	local t = typeof(val)
+	if depth > 1 then return "..." end
+	local t = typeof(v)
 	if t == "table" then
-		if seen[val] then return "{<cycle>}" end
-		seen[val] = true
-		local out = {"{\n"}
-		for k,v in pairs(val) do
-			table.insert(out, string.rep("  ", depth+1) .. "["..tostring(k).."] = " .. dump(v, depth+1, seen) .. "\n")
+		local parts = {}
+		local n = 0
+		for k,_ in pairs(v) do
+			n += 1
+			if n > 5 then break end
+			table.insert(parts, tostring(k))
 		end
-		table.insert(out, string.rep("  ", depth).."}")
-		return table.concat(out)
+		return "table{keys="..table.concat(parts,",")..(n>5 and ",..." or "").."}"
 	elseif t == "Instance" then
-		return "Instance<"..val.ClassName..">:"..val:GetFullName()
+		return "Instance<"..v.ClassName..">:"..v.Name
 	else
-		return t.."("..tostring(val)..")"
+		return t.."("..tostring(v)..")"
 	end
 end
 
-local function safeWrap(tbl, fnName)
-	if type(tbl[fnName]) == "function" then
-		local old = tbl[fnName]
-		tbl[fnName] = function(...)
-			print("[Spy] "..fnName.." called:")
-			local args = {...}
-			for i,v in ipairs(args) do
-				print(" arg["..i.."] = "..dump(v))
+local function summarizeArgs(args)
+	local out = {}
+	for i,v in ipairs(args) do
+		out[#out+1] = "["..i.."] "..summarize(v)
+	end
+	return table.concat(out, " | ")
+end
+
+-- hook client->server calls
+do
+	local ok, mt = pcall(getrawmetatable, game)
+	if ok and mt and mt.__namecall then
+		local old = mt.__namecall
+		pcall(function() setreadonly(mt,false) end)
+		mt.__namecall = function(self, ...)
+			local m = getnamecallmethod and getnamecallmethod() or ""
+			if (m=="FireServer" or m=="InvokeServer") and typeof(self)=="Instance" 
+				and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+				local args = {...}
+				print(("\n[Spy] %s -> %s"):format(m, self:GetFullName()))
+				print("   Args: "..summarizeArgs(args))
 			end
-			return old(...)
+			return old(self, ...)
 		end
-		print("[Spy] Wrapped "..fnName)
+		pcall(function() setreadonly(mt,true) end)
+		print("[TrimSpy] __namecall hook active.")
 	else
-		print("[Spy] "..fnName.." not a function, type="..typeof(tbl[fnName]))
+		print("[TrimSpy] __namecall hook not available in this environment.")
 	end
 end
 
-if ok and type(Lasso)=="table" then
-	safeWrap(Lasso, "_hit")
-	safeWrap(Lasso, "doLasso")
-else
-	warn("[Spy] Could not require Lasso module.")
-end
+print("[TrimSpy] Ready. Do a tame, watch console for FireServer/InvokeServer calls.")
