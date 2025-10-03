@@ -1,58 +1,47 @@
--- TrimmedRemoteSpy.client.lua
--- Put into StarterPlayerScripts
-
-local RS = game:GetService("ReplicatedStorage")
-
--- helper to summarize any value without huge spam
-local function summarize(v, depth)
-	depth = depth or 0
-	if depth > 1 then return "..." end
-	local t = typeof(v)
-	if t == "table" then
-		local parts = {}
-		local n = 0
-		for k,_ in pairs(v) do
-			n += 1
-			if n > 5 then break end
-			table.insert(parts, tostring(k))
-		end
-		return "table{keys="..table.concat(parts,",")..(n>5 and ",..." or "").."}"
-	elseif t == "Instance" then
-		return "Instance<"..v.ClassName..">:"..v.Name
-	else
-		return t.."("..tostring(v)..")"
-	end
+-- OutboundOnlySpy.client.lua  (read-only)
+local function brief(v, d)
+    d = d or 0
+    if d > 1 then return "..." end
+    local t = typeof(v)
+    if t == "table" then
+        local keys, n = {}, 0
+        for k,_ in pairs(v) do
+            n += 1
+            if #keys < 5 then table.insert(keys, tostring(k)) end
+        end
+        return ("table{%s%s}"):format(table.concat(keys, ","), n>5 and ",..." or "")
+    elseif t == "Instance" then
+        return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
+    else
+        return ("%s(%s)"):format(t, tostring(v))
+    end
 end
 
-local function summarizeArgs(args)
-	local out = {}
-	for i,v in ipairs(args) do
-		out[#out+1] = "["..i.."] "..summarize(v)
-	end
-	return table.concat(out, " | ")
+local function briefArgs(args)
+    local out = {}
+    for i,v in ipairs(args) do out[#out+1] = ("[%d] %s"):format(i, brief(v)) end
+    return table.concat(out, " | ")
 end
 
--- hook client->server calls
 do
-	local ok, mt = pcall(getrawmetatable, game)
-	if ok and mt and mt.__namecall then
-		local old = mt.__namecall
-		pcall(function() setreadonly(mt,false) end)
-		mt.__namecall = function(self, ...)
-			local m = getnamecallmethod and getnamecallmethod() or ""
-			if (m=="FireServer" or m=="InvokeServer") and typeof(self)=="Instance" 
-				and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-				local args = {...}
-				print(("\n[Spy] %s -> %s"):format(m, self:GetFullName()))
-				print("   Args: "..summarizeArgs(args))
-			end
-			return old(self, ...)
-		end
-		pcall(function() setreadonly(mt,true) end)
-		print("[TrimSpy] __namecall hook active.")
-	else
-		print("[TrimSpy] __namecall hook not available in this environment.")
-	end
+    local ok, mt = pcall(getrawmetatable, game)
+    if ok and mt and mt.__namecall then
+        local old = mt.__namecall
+        pcall(function() setreadonly(mt,false) end)
+        mt.__namecall = function(self, ...)
+            local m = getnamecallmethod and getnamecallmethod() or ""
+            if (m == "FireServer" or m == "InvokeServer")
+            and typeof(self) == "Instance"
+            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+                local args = { ... }
+                print(("\n[Outbound] %s -> %s"):format(m, self:GetFullName()))
+                print("   Args: "..briefArgs(args))
+            end
+            return old(self, ...)
+        end
+        pcall(function() setreadonly(mt,true) end)
+        print("[OutboundSpy] active (read-only).")
+    else
+        warn("[OutboundSpy] __namecall hook unavailable here.")
+    end
 end
-
-print("[TrimSpy] Ready. Do a tame, watch console for FireServer/InvokeServer calls.")
