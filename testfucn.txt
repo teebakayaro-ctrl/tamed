@@ -1,101 +1,55 @@
--- OutboundOnlySpy.client.lua
--- Safe: read-only, logs only client -> server calls
-
--- ======= CONFIG =======
--- เลือกว่าจะโชว์ arg index ไหน (true = แสดง, false/ไม่มี = ซ่อน)
-local SHOW = { [1] = true, [2] = false, [3] = true }  -- ตอนนี้โชว์เฉพาะ 1 และ 3
-
--- ถ้าอยากฟิลเตอร์ชื่อรีโมต (ใส่บางคำ), เว้นว่าง = log ทุกตัว
-local NAME_FILTER = { "Tame", "Lasso", "Horse", "ReplicateItem", "Store", "Sell" }
--- ======================
-
-local function nameMatches(path)
-	if not NAME_FILTER or #NAME_FILTER == 0 then return true end
-	for _,kw in ipairs(NAME_FILTER) do
-		if string.find(string.lower(path), string.lower(kw), 1, true) then
-			return true
-		end
-	end
-	return false
-end
+-- OutboundSpy_AllArgs.client.lua
+-- ✅ Read-only spy, safe, ไม่ยุ่งกับ module
+-- ✅ แสดง args ทั้งหมดทุกครั้งที่ client FireServer / InvokeServer
 
 local function brief(v, depth)
-	depth = depth or 0
-	if depth > 1 then return "..." end
-	local t = typeof(v)
-	if t == "table" then
-		local keys, n = {}, 0
-		for k,_ in pairs(v) do
-			n += 1
-			if #keys < 6 then table.insert(keys, tostring(k)) end
-		end
-		return ("table{%s%s}"):format(table.concat(keys,","), n>6 and ",..." or "")
-	elseif t == "Instance" then
-		return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
-	elseif t == "Vector3" or t == "CFrame" or t == "UDim2" then
-		return t.."("..tostring(v)..")"
-	else
-		return ("%s(%s)"):format(t, tostring(v))
-	end
+    depth = depth or 0
+    if depth > 2 then return "..." end
+    local t = typeof(v)
+    if t == "table" then
+        local keys, n = {}, 0
+        for k,_ in pairs(v) do
+            n += 1
+            if #keys < 6 then table.insert(keys, tostring(k)) end
+        end
+        return ("table{%s%s}"):format(table.concat(keys,","), n>6 and ",..." or "")
+    elseif t == "Instance" then
+        return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
+    else
+        return ("%s(%s)"):format(t, tostring(v))
+    end
 end
 
-local function summarizeSelected(args)
-	local out = {}
-	for i,v in ipairs(args) do
-		if SHOW[i] then
-			out[#out+1] = ("[%d] %s"):format(i, brief(v))
-		end
-	end
-	return (#out > 0) and table.concat(out, " | ") or "(no selected args)"
+local function summarizeArgs(args)
+    local out = {}
+    for i,v in ipairs(args) do
+        out[#out+1] = ("[%d] %s"):format(i, brief(v))
+    end
+    return table.concat(out, " | ")
 end
-
--- Optional: เก็บ log ล่าสุดไว้ replay ได้
-local LOG, MAX = {}, 200
-_G.OutboundSpy = {
-	Log = LOG,
-	Replay = function(i)
-		local e = LOG[i]; if not e then return warn("No log index:", i) end
-		if not e.remote or not e.remote.Parent then return warn("Remote no longer exists") end
-		if e.method == "FireServer" then
-			print("[Replay] FireServer ->", e.path)
-			e.remote:FireServer(table.unpack(e.args))
-		elseif e.method == "InvokeServer" then
-			print("[Replay] InvokeServer ->", e.path)
-			local ok, res = pcall(function() return e.remote:InvokeServer(table.unpack(e.args)) end)
-			print("  ok?", ok, "res:", res)
-		end
-	end
-}
 
 do
-	local ok, mt = pcall(getrawmetatable, game)
-	if not (ok and mt and mt.__namecall) then
-		return warn("[OutboundOnlySpy] __namecall hook unavailable.")
-	end
+    local ok, mt = pcall(getrawmetatable, game)
+    if not (ok and mt and mt.__namecall) then
+        return warn("[OutboundSpy] __namecall hook unavailable.")
+    end
 
-	local old = mt.__namecall
-	pcall(function() setreadonly(mt,false) end)
+    local old = mt.__namecall
+    pcall(function() setreadonly(mt,false) end)
 
-	mt.__namecall = function(self, ...)
-		local m = getnamecallmethod and getnamecallmethod() or ""
-		if (m == "FireServer" or m == "InvokeServer")
-			and typeof(self) == "Instance"
-			and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+    mt.__namecall = function(self, ...)
+        local m = getnamecallmethod and getnamecallmethod() or ""
+        if (m == "FireServer" or m == "InvokeServer")
+            and typeof(self)=="Instance"
+            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
 
-			local path = self:GetFullName()
-			if nameMatches(path) then
-				local args = { ... }
-				print(("\n[Outbound] %s -> %s"):format(m, path))
-				print("   Args: "..summarizeSelected(args))
+            local args = {...}
+            print(("\n[Outbound] %s -> %s"):format(m, self:GetFullName()))
+            print("   Args: "..summarizeArgs(args))
+        end
+        return old(self, ...)
+    end
 
-				-- save compact log for replay
-				local entry = { method=m, path=path, remote=self, args=args }
-				table.insert(LOG, entry); if #LOG > MAX then table.remove(LOG,1) end
-			end
-		end
-		return old(self, ...)
-	end
-
-	pcall(function() setreadonly(mt,true) end)
-	print("[OutboundOnlySpy] active (read-only). Showing args indexes:", SHOW[1] and "1 " or "", SHOW[2] and "2 " or "", SHOW[3] and "3 " or "")
+    pcall(function() setreadonly(mt,true) end)
+    print("[OutboundSpy] active. Printing ALL args.")
 end
