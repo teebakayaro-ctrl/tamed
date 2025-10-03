@@ -1,107 +1,101 @@
--- MergedTameSpy.client.lua
--- 1) Lasso._hit wrapper (prints only arg[1], arg[3])
--- 2) Outbound-only remote logger via __namecall (read-only)
+-- OutboundOnlySpy.client.lua
+-- Safe: read-only, logs only client -> server calls
 
-local RS = game:GetService("ReplicatedStorage")
+-- ======= CONFIG =======
+-- เลือกว่าจะโชว์ arg index ไหน (true = แสดง, false/ไม่มี = ซ่อน)
+local SHOW = { [1] = true, [2] = false, [3] = true }  -- ตอนนี้โชว์เฉพาะ 1 และ 3
 
-----------------------------------------------------------------------
--- brief printers (keep output short)
-----------------------------------------------------------------------
-local function fullname(i)
-  local p, t = i, {}
-  while p do t[#t+1] = p.Name; p = p.Parent end
-  for a=1,#t//2 do t[a],t[#t-a+1]=t[#t-a+1],t[a] end
-  return table.concat(t,".")
+-- ถ้าอยากฟิลเตอร์ชื่อรีโมต (ใส่บางคำ), เว้นว่าง = log ทุกตัว
+local NAME_FILTER = { "Tame", "Lasso", "Horse", "ReplicateItem", "Store", "Sell" }
+-- ======================
+
+local function nameMatches(path)
+	if not NAME_FILTER or #NAME_FILTER == 0 then return true end
+	for _,kw in ipairs(NAME_FILTER) do
+		if string.find(string.lower(path), string.lower(kw), 1, true) then
+			return true
+		end
+	end
+	return false
 end
 
 local function brief(v, depth)
-  depth = depth or 0
-  if depth > 1 then return "..." end
-  local ty = typeof(v)
-  if ty == "table" then
-    local keys, n = {}, 0
-    for k,_ in pairs(v) do
-      n += 1
-      if #keys < 6 then table.insert(keys, tostring(k)) end
-    end
-    return ("table{%s%s}"):format(table.concat(keys,","), n>6 and ",..." or "")
-  elseif ty == "Instance" then
-    return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
-  elseif ty == "Vector3" or ty == "CFrame" or ty == "UDim2" then
-    return ty.."("..tostring(v)..")"
-  else
-    return ("%s(%s)"):format(ty, tostring(v))
-  end
+	depth = depth or 0
+	if depth > 1 then return "..." end
+	local t = typeof(v)
+	if t == "table" then
+		local keys, n = {}, 0
+		for k,_ in pairs(v) do
+			n += 1
+			if #keys < 6 then table.insert(keys, tostring(k)) end
+		end
+		return ("table{%s%s}"):format(table.concat(keys,","), n>6 and ",..." or "")
+	elseif t == "Instance" then
+		return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
+	elseif t == "Vector3" or t == "CFrame" or t == "UDim2" then
+		return t.."("..tostring(v)..")"
+	else
+		return ("%s(%s)"):format(t, tostring(v))
+	end
 end
 
-local function show13(args)
-  if args[1] ~= nil then print("  arg[1] =", brief(args[1])) end
-  if args[3] ~= nil then print("  arg[3] =", brief(args[3])) end
+local function summarizeSelected(args)
+	local out = {}
+	for i,v in ipairs(args) do
+		if SHOW[i] then
+			out[#out+1] = ("[%d] %s"):format(i, brief(v))
+		end
+	end
+	return (#out > 0) and table.concat(out, " | ") or "(no selected args)"
 end
 
-----------------------------------------------------------------------
--- (A) Lasso._hit wrapper (safe)
-----------------------------------------------------------------------
+-- Optional: เก็บ log ล่าสุดไว้ replay ได้
+local LOG, MAX = {}, 200
+_G.OutboundSpy = {
+	Log = LOG,
+	Replay = function(i)
+		local e = LOG[i]; if not e then return warn("No log index:", i) end
+		if not e.remote or not e.remote.Parent then return warn("Remote no longer exists") end
+		if e.method == "FireServer" then
+			print("[Replay] FireServer ->", e.path)
+			e.remote:FireServer(table.unpack(e.args))
+		elseif e.method == "InvokeServer" then
+			print("[Replay] InvokeServer ->", e.path)
+			local ok, res = pcall(function() return e.remote:InvokeServer(table.unpack(e.args)) end)
+			print("  ok?", ok, "res:", res)
+		end
+	end
+}
+
 do
-  local repFolder = RS:FindFirstChild("_replicationFolder")
-  if repFolder then
-    local lassoMod = repFolder:FindFirstChild("Lasso")
-    if lassoMod and lassoMod:IsA("ModuleScript") then
-      local okReq, Lasso = pcall(require, lassoMod)
-      if okReq and type(Lasso) == "table" then
-        local f = rawget(Lasso, "_hit")
-        if type(f) == "function" then
-          Lasso._hit = function(...)
-            local a = { ... }
-            print("[Spy] _hit called:")
-            show13(a)  -- print only arg[1], arg[3]
-            local ok, r1, r2, r3, r4 = pcall(f, table.unpack(a))
-            if not ok then warn("[Spy] _hit error:", r1) return end
-            return r1, r2, r3, r4
-          end
-          print("[Spy] Wrapped _hit (printing only arg[1], arg[3])")
-        else
-          print("[Spy] _hit not a function (type="..typeof(f)..")")
-        end
-      else
-        print("[Spy] require(Lasso) failed:", tostring(Lasso))
-      end
-    else
-      print("[Spy] Lasso ModuleScript not found; skip _hit wrap")
-    end
-  else
-    print("[Spy] _replicationFolder not found; skip _hit wrap")
-  end
-end
+	local ok, mt = pcall(getrawmetatable, game)
+	if not (ok and mt and mt.__namecall) then
+		return warn("[OutboundOnlySpy] __namecall hook unavailable.")
+	end
 
-----------------------------------------------------------------------
--- (B) Outbound-only remote spy (FireServer / InvokeServer)
---     Read-only: does NOT set OnClientInvoke, does NOT mutate game logic
-----------------------------------------------------------------------
-do
-  local ok, mt = pcall(getrawmetatable, game)
-  if ok and mt and mt.__namecall then
-    local old = mt.__namecall
-    pcall(function() setreadonly(mt, false) end)
-    mt.__namecall = function(self, ...)
-      local m = getnamecallmethod and getnamecallmethod() or ""
-      if (m == "FireServer" or m == "InvokeServer")
-         and typeof(self) == "Instance"
-         and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-        local args = { ... }
-        -- concise arg summary
-        local parts = {}
-        for i,v in ipairs(args) do parts[#parts+1] = ("[%d] %s"):format(i, brief(v)) end
-        print(("\n[Outbound] %s -> %s"):format(m, self:GetFullName()))
-        print("   Args: "..table.concat(parts, " | "))
-      end
-      return old(self, ...)
-    end
-    pcall(function() setreadonly(mt, true) end)
-    print("[OutboundSpy] active (read-only)")
-  else
-    warn("[OutboundSpy] __namecall hook unavailable here.")
-  end
-end
+	local old = mt.__namecall
+	pcall(function() setreadonly(mt,false) end)
 
-print("[MergedTameSpy] Ready. Do a normal tame; watch _hit (arg1,arg3) and outbound remotes.")
+	mt.__namecall = function(self, ...)
+		local m = getnamecallmethod and getnamecallmethod() or ""
+		if (m == "FireServer" or m == "InvokeServer")
+			and typeof(self) == "Instance"
+			and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+
+			local path = self:GetFullName()
+			if nameMatches(path) then
+				local args = { ... }
+				print(("\n[Outbound] %s -> %s"):format(m, path))
+				print("   Args: "..summarizeSelected(args))
+
+				-- save compact log for replay
+				local entry = { method=m, path=path, remote=self, args=args }
+				table.insert(LOG, entry); if #LOG > MAX then table.remove(LOG,1) end
+			end
+		end
+		return old(self, ...)
+	end
+
+	pcall(function() setreadonly(mt,true) end)
+	print("[OutboundOnlySpy] active (read-only). Showing args indexes:", SHOW[1] and "1 " or "", SHOW[2] and "2 " or "", SHOW[3] and "3 " or "")
+end
