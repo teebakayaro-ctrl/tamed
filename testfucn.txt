@@ -1,47 +1,48 @@
--- OutboundOnlySpy.client.lua  (read-only)
-local function brief(v, d)
-    d = d or 0
-    if d > 1 then return "..." end
-    local t = typeof(v)
-    if t == "table" then
-        local keys, n = {}, 0
-        for k,_ in pairs(v) do
-            n += 1
-            if #keys < 5 then table.insert(keys, tostring(k)) end
-        end
-        return ("table{%s%s}"):format(table.concat(keys, ","), n>5 and ",..." or "")
-    elseif t == "Instance" then
-        return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
-    else
-        return ("%s(%s)"):format(t, tostring(v))
-    end
+local RS = game:GetService("ReplicatedStorage")
+local repFolder = RS:WaitForChild("_replicationFolder")
+local ok, Lasso = pcall(require, repFolder:WaitForChild("Lasso"))
+
+-- Pretty dumper for any value
+local function dump(val, depth, seen)
+	depth = depth or 0
+	seen = seen or {}
+	local t = typeof(val)
+	if t == "table" then
+		if seen[val] then return "{<cycle>}" end
+		seen[val] = true
+		local out = {"{\n"}
+		for k,v in pairs(val) do
+			table.insert(out, string.rep("  ", depth+1) .. "["..tostring(k).."] = " .. dump(v, depth+1, seen) .. "\n")
+		end
+		table.insert(out, string.rep("  ", depth).."}")
+		return table.concat(out)
+	elseif t == "Instance" then
+		return "Instance<"..val.ClassName..">:"..val:GetFullName()
+	else
+		return t.."("..tostring(val)..")"
+	end
 end
 
-local function briefArgs(args)
-    local out = {}
-    for i,v in ipairs(args) do out[#out+1] = ("[%d] %s"):format(i, brief(v)) end
-    return table.concat(out, " | ")
+local function safeWrap(tbl, fnName)
+	if type(tbl[fnName]) == "function" then
+		local old = tbl[fnName]
+		tbl[fnName] = function(...)
+			print("[Spy] "..fnName.." called:")
+			local args = {...}
+			for i,v in ipairs(args) do
+				if i != 2 then print(" arg["..i.."] = "..dump(v)) end
+			end
+			return old(...)
+		end
+		print("[Spy] Wrapped "..fnName)
+	else
+		print("[Spy] "..fnName.." not a function, type="..typeof(tbl[fnName]))
+	end
 end
 
-do
-    local ok, mt = pcall(getrawmetatable, game)
-    if ok and mt and mt.__namecall then
-        local old = mt.__namecall
-        pcall(function() setreadonly(mt,false) end)
-        mt.__namecall = function(self, ...)
-            local m = getnamecallmethod and getnamecallmethod() or ""
-            if (m == "FireServer" or m == "InvokeServer")
-            and typeof(self) == "Instance"
-            and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
-                local args = { ... }
-                print(("\n[Outbound] %s -> %s"):format(m, self:GetFullName()))
-                print("   Args: "..briefArgs(args))
-            end
-            return old(self, ...)
-        end
-        pcall(function() setreadonly(mt,true) end)
-        print("[OutboundSpy] active (read-only).")
-    else
-        warn("[OutboundSpy] __namecall hook unavailable here.")
-    end
+if ok and type(Lasso)=="table" then
+	safeWrap(Lasso, "_hit")
+	safeWrap(Lasso, "doLasso")
+else
+	warn("[Spy] Could not require Lasso module.")
 end
