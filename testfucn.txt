@@ -1,23 +1,39 @@
--- GLOBAL REMOTE SPY v1.2-mini (no bindables; nil-safe)
--- Logs ALL RemoteEvent/RemoteFunction Fire*/Invoke* calls across the game.
--- Stores recent logs in _G.REMOTE_SPY_LOGS. Helpers: RemoteSpyGet(n), RemoteSpyFilter(substr,n), RemoteSpyClear().
+-- SCOPED TAME SPY v2.0 (nil-safe, minimal deps)
+-- Focused logging for Horse/Lasso/Tame/Catch/Hit/etc.
+-- Uses hookmetamethod if available, otherwise raw __namecall if safe.
 
-local MAX_LOGS = 1000
-local PREVIEW_MAX = 6
+-- ===== CONFIG =====
+local MAX_LOGS = 600
+local PREVIEW_MAX = 5
 
--- ---- compat shims ----
-local has_hook = (type(hookmetamethod) == "function")
-local has_getname = (type(getnamecallmethod) == "function")
-local has_check = (type(checkcaller) == "function")
+-- default keywords (receiver path OR args must match one of these, case-insensitive)
+local KEYWORDS = {
+    "lasso","tame","horse","stallion","mustang","mount","ride","catch","rope","doLasso","hit",
+    "buck","break","bridle","halter"
+}
+-- optional path scopes (only log if receiver full path contains one of these; leave empty to ignore)
+local PATH_SCOPES = {
+    "ReplicatedStorage._replicationFolder",
+    "ReplicatedStorage.Remotes",
+    "Workspace",
+}
+
+-- capture window (set >0 to log only while window active)
+local captureUntil = 0 -- os.clock() seconds; use TameSpyStartWindow(8) to arm for 8s
+
+-- ====== internals ======
+local has_hook = type(hookmetamethod) == "function"
+local has_getname = type(getnamecallmethod) == "function"
+local has_check = type(checkcaller) == "function"
 local getNC = has_getname and getnamecallmethod or function() return "" end
 local isCaller = has_check and checkcaller or function() return false end
 
-_G.REMOTE_SPY_LOGS = _G.REMOTE_SPY_LOGS or {}
+_G.TAME_SPY_LOGS = _G.TAME_SPY_LOGS or {}
 
 local function pushLog(e)
-    table.insert(_G.REMOTE_SPY_LOGS, 1, e)
-    if #_G.REMOTE_SPY_LOGS > MAX_LOGS then
-        for i = MAX_LOGS+1, #_G.REMOTE_SPY_LOGS do _G.REMOTE_SPY_LOGS[i] = nil end
+    table.insert(_G.TAME_SPY_LOGS, 1, e)
+    if #_G.TAME_SPY_LOGS > MAX_LOGS then
+        for i=MAX_LOGS+1, #_G.TAME_SPY_LOGS do _G.TAME_SPY_LOGS[i] = nil end
     end
 end
 
@@ -25,39 +41,106 @@ local function safeToStr(v)
     local t = typeof(v)
     if t == "Instance" then
         local ok, full = pcall(function() return v:GetFullName() end)
-        return ok and ("<%s:%s>"):format(v.ClassName, full) or ("<%s>" ):format(v.ClassName)
+        return ok and ("<%s:%s>"):format(v.ClassName, full) or ("<%s>"):format(v.ClassName)
     end
     local ok, s = pcall(function() return tostring(v) end)
-    return ok and s or ("<unprintable:%s>"):format(t)
+    return ok and s or ("<unprintable:"..t..">")
 end
 
 local function previewFromPack(p)
     local n = p.n or #p
     local parts = {}
     local cap = math.min(n, PREVIEW_MAX)
-    for i = 1, cap do parts[i] = safeToStr(p[i]) end
+    for i=1, cap do parts[i] = safeToStr(p[i]) end
     if n > PREVIEW_MAX then parts[#parts+1] = ("...(+%d)"):format(n - PREVIEW_MAX) end
     return table.concat(parts, ", ")
 end
 
-local function shortStack()
-    local ok, tb = pcall(function() return debug.traceback("", 3) end)
-    if not ok or not tb then return "" end
-    local k, out = 0, {}
-    for line in tb:gmatch("[^\n]+") do
-        k = k + 1; out[#out+1] = line
-        if k >= 5 then break end
-    end
-    return table.concat(out, " | ")
+local function toLower(s)
+    if not s then return "" end
+    local ok, low = pcall(string.lower, s)
+    return ok and low or tostring(s)
 end
 
--- ---- hook via hookmetamethod (preferred) ----
+local function anyMatchLower(str, list)
+    if not str or #list == 0 then return false end
+    local low = toLower(str)
+    for _, kw in ipairs(list) do
+        if low:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function argsContainKeyword(pack, list)
+    local n = pack.n or #pack
+    for i=1, n do
+        local v = pack[i]
+        -- check common arg types for textual hints
+        if type(v) == "string" then
+            if anyMatchLower(v, list) then return true end
+        elseif typeof(v) == "Instance" then
+            local ok, name = pcall(function() return v.Name end)
+            if ok and anyMatchLower(name, list) then return true end
+            local ok2, full = pcall(function() return v:GetFullName() end)
+            if ok2 and anyMatchLower(full, list) then return true end
+        end
+    end
+    return false
+end
+
+local function inPathScopes(fullname)
+    if #PATH_SCOPES == 0 then return true end
+    for _, scope in ipairs(PATH_SCOPES) do
+        if fullname:find(scope, 1, true) then return true end
+    end
+    return false
+end
+
+local function shouldLog(self, method, pack)
+    -- only during capture window if armed
+    if captureUntil > 0 and os.clock() > captureUntil then
+        captureUntil = 0
+    end
+    if captureUntil > 0 then
+        -- in window: still enforce keyword/path so it's not insane
+        -- (comment next line if you want "all in window")
+        -- return true
+    end
+
+    -- gate on remote method class
+    if not (method == "FireServer" or method == "InvokeServer" or method == "FireClient" or method == "InvokeClient" or method == "FireAllClients") then
+        return false
+    end
+
+    -- receiver path & name checks
+    local full = (typeof(self) == "Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or ""
+    local name = (typeof(self) == "Instance" and self.Name) or ""
+    if not inPathScopes(full) then return false end
+
+    -- keyword match: receiver name/path OR args must mention keywords
+    local lowerList = KEYWORDS -- already lower in config
+    if anyMatchLower(full, lowerList) or anyMatchLower(name, lowerList) or argsContainKeyword(pack, lowerList) then
+        return true
+    end
+    return false
+end
+
+local function shortPrint(e)
+    local ts = os.date("%H:%M:%S", e.time or os.time())
+    print(("[TAME-SPY][%s] %s -> %s | [%s]%s"):format(
+        ts, e.receiver or "?", e.method or "?", e.argsPreview or "",
+        e.returnsPreview and (" | ret=["..e.returnsPreview.."]") or ""
+    ))
+end
+
+-- ===== hooking =====
 local hooked = false
+
 if has_hook then
     local original = hookmetamethod(game, "__namecall", function(self, ...)
         local m = getNC()
-        if m == "FireServer" or m == "FireClient" or m == "FireAllClients" or m == "InvokeServer" or m == "InvokeClient" then
-            local pack = table.pack(...)
+        local pack = table.pack(...)
+        if shouldLog(self, m, pack) then
             local entry = {
                 time = os.time(),
                 method = m,
@@ -65,47 +148,33 @@ if has_hook then
                 class = (typeof(self) == "Instance" and self.ClassName) or typeof(self),
                 argsPreview = previewFromPack(pack),
                 originIsScript = isCaller(),
-                stack = shortStack(),
             }
-
             if m:sub(1,6) == "Invoke" then
                 local ok, r1, r2, r3 = pcall(original, self, ...)
-                entry.invokeSuccess = ok
                 if ok then entry.returnsPreview = previewFromPack(table.pack(r1, r2, r3)) end
-                pushLog(entry)
-                print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s | ret=[%s]"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok), entry.returnsPreview or ""))
+                pushLog(entry); shortPrint(entry)
                 if ok then return r1, r2, r3 else error(tostring(r1)) end
             else
                 local ok, err = pcall(original, self, ...)
-                entry.fireSuccess = ok
-                if not ok then entry.error = tostring(err) end
-                pushLog(entry)
-                print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok)))
+                pushLog(entry); shortPrint(entry)
+                if not ok then warn("[TAME-SPY] Fire* forward error: "..tostring(err)) end
                 return
             end
         end
         return original(self, ...)
     end)
-
-    -- some executors return nil instead of the original (bad!); guard that:
-    if type(original) == "function" then
-        hooked = true
-    else
-        warn("[REMOTE-SPY] hookmetamethod returned nil; disabling this path.")
-    end
+    if type(original) == "function" then hooked = true else warn("[TAME-SPY] hookmetamethod returned nil; fallback…") end
 end
 
--- ---- raw metatable fallback (only if safe) ----
 if not hooked then
     local ok_mt, mt = pcall(getrawmetatable, game)
     if ok_mt and mt and type(mt.__namecall) == "function" then
         local old = mt.__namecall
-        local canWrite = (type(setreadonly) == "function")
-        if canWrite then pcall(setreadonly, mt, false) end
+        pcall(setreadonly, mt, false)
         mt.__namecall = (type(newcclosure) == "function" and newcclosure or function(f) return f end)(function(self, ...)
             local m = getNC()
-            if m == "FireServer" or m == "FireClient" or m == "FireAllClients" or m == "InvokeServer" or m == "InvokeClient" then
-                local pack = table.pack(...)
+            local pack = table.pack(...)
+            if shouldLog(self, m, pack) then
                 local entry = {
                     time = os.time(),
                     method = m,
@@ -113,52 +182,72 @@ if not hooked then
                     class = (typeof(self) == "Instance" and self.ClassName) or typeof(self),
                     argsPreview = previewFromPack(pack),
                     originIsScript = isCaller(),
-                    stack = shortStack(),
                 }
                 if m:sub(1,6) == "Invoke" then
                     local ok2, r1, r2, r3 = pcall(old, self, ...)
-                    entry.invokeSuccess = ok2
                     if ok2 then entry.returnsPreview = previewFromPack(table.pack(r1, r2, r3)) end
-                    pushLog(entry)
-                    print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s | ret=[%s]"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok2), entry.returnsPreview or ""))
+                    pushLog(entry); shortPrint(entry)
                     if ok2 then return r1, r2, r3 else error(tostring(r1)) end
                 else
                     local ok2, err = pcall(old, self, ...)
-                    entry.fireSuccess = ok2
-                    if not ok2 then entry.error = tostring(err) end
-                    pushLog(entry)
-                    print(("[REMOTE-SPY] %s -> %s | [%s] | ok=%s"):format(entry.receiver or "?", m, entry.argsPreview or "", tostring(ok2)))
+                    pushLog(entry); shortPrint(entry)
+                    if not ok2 then warn("[TAME-SPY] Fire* forward error: "..tostring(err)) end
                     return
                 end
             end
             return old(self, ...)
         end)
-        if canWrite then pcall(setreadonly, mt, true) end
+        pcall(setreadonly, mt, true)
         hooked = true
     end
 end
 
-if not hooked then
-    warn("[REMOTE-SPY] Could not hook __namecall (no working hookmetamethod and raw __namecall unavailable). Your executor likely doesn’t support call interception.")
+if hooked then
+    print("[TAME-SPY] Scoped hook active. Watching horse/lasso/tame-related remotes.")
 else
-    print("[REMOTE-SPY] Active. Logging RemoteEvent/RemoteFunction Fire*/Invoke* across game.")
+    warn("[TAME-SPY] Could not hook __namecall; executor may not support interception.")
 end
 
--- ---- helpers ----
-_G.RemoteSpyGet = function(n)
+-- ====== runtime controls you can call from console ======
+_G.TameSpySetKeywords = function(list)
+    KEYWORDS = {}
+    for _, w in ipairs(list) do KEYWORDS[#KEYWORDS+1] = string.lower(tostring(w)) end
+    print("[TAME-SPY] keywords set:", table.concat(KEYWORDS, ", "))
+end
+
+_G.TameSpyAddKeywords = function(list)
+    for _, w in ipairs(list) do KEYWORDS[#KEYWORDS+1] = string.lower(tostring(w)) end
+    print("[TAME-SPY] keywords now:", table.concat(KEYWORDS, ", "))
+end
+
+_G.TameSpySetPathScopes = function(scopes)
+    PATH_SCOPES = {}
+    for _, p in ipairs(scopes) do PATH_SCOPES[#PATH_SCOPES+1] = tostring(p) end
+    print("[TAME-SPY] path scopes set:", table.concat(PATH_SCOPES, " | "))
+end
+
+_G.TameSpyStartWindow = function(seconds)
+    captureUntil = os.clock() + (tonumber(seconds) or 6)
+    print(string.format("[TAME-SPY] capture window armed for %.2fs", (tonumber(seconds) or 6)))
+end
+
+_G.TameSpyGet = function(n)
     n = n or 50
     local out = {}
-    for i=1, math.min(n, #_G.REMOTE_SPY_LOGS) do out[i] = _G.REMOTE_SPY_LOGS[i] end
+    for i=1, math.min(n, #_G.TAME_SPY_LOGS) do out[i] = _G.TAME_SPY_LOGS[i] end
     return out
 end
-_G.RemoteSpyFilter = function(substr, n)
-    n = n or 100
+
+_G.TameSpyFilter = function(substr, n)
+    n = n or 50
     local res = {}
-    for i=1, #_G.REMOTE_SPY_LOGS do
-        local e = _G.REMOTE_SPY_LOGS[i]
+    substr = tostring(substr or "")
+    for i=1, #_G.TAME_SPY_LOGS do
+        local e = _G.TAME_SPY_LOGS[i]
         if e and (
-            (e.receiver and tostring(e.receiver):find(substr, 1, true)) or
-            (e.method and tostring(e.method):find(substr, 1, true))
+            (e.receiver and e.receiver:find(substr, 1, true)) or
+            (e.method and e.method:find(substr, 1, true)) or
+            (e.argsPreview and e.argsPreview:find(substr, 1, true))
         ) then
             res[#res+1] = e
             if #res >= n then break end
@@ -166,7 +255,8 @@ _G.RemoteSpyFilter = function(substr, n)
     end
     return res
 end
-_G.RemoteSpyClear = function()
-    _G.REMOTE_SPY_LOGS = {}
-    print("[REMOTE-SPY] cleared.")
+
+_G.TameSpyClear = function()
+    _G.TAME_SPY_LOGS = {}
+    print("[TAME-SPY] cleared.")
 end
