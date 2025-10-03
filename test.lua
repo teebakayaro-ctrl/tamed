@@ -1,125 +1,184 @@
--- AutoTame v0.1 — reuse last _hit args, retarget to nearest horse, then call _hit
--- Requirements: You've already run HitCompact and got at least one [_hit] capture.
-
+-- safe-logger.lua  (replace parts of your test.lua with this)
+local RS = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
+local HttpService = game:GetService("HttpService")
 
--- shallow copy
-local function copy(t)
-    if typeof(t) ~= "table" then return t end
-    local r = {}
-    for k,v in pairs(t) do r[k] = v end
-    return r
-end
+local repFolder = RS:WaitForChild("_replicationFolder")
+local ok, Lasso = pcall(require, repFolder:WaitForChild("Lasso"))
 
--- find nearest Model that looks like a horse
-local HORSE_HINTS = { "horse", "mustang", "stallion", "bronco" }
-local function looksHorsey(model)
-    local name = string.lower(model.Name or "")
-    for _,h in ipairs(HORSE_HINTS) do
-        if name:find(h, 1, true) then return true end
+-- CONFIG
+local DEPTH_LIMIT = 3
+local MAX_ITEMS_PER_TABLE = 25
+local LOG_BUFFER_SIZE = 800    -- เก็บ N ล่าสุด
+local SKIP_INSTANCE_DETAILS = true -- ถ้า true: แสดงแค่ summary ของ Instance
+local BLACKLIST_INSTANCE_NAMES = { ["Character"] = true } -- ปรับตามต้องการ
+local SILENT_ARG_INDEX = { [2] = true } -- index ที่คุณอยากข้าม (ตามโค้ดเดิม)
+
+-- circular buffer
+local logBuffer = {}
+local logStart = 1
+local logCount = 0
+local function pushLogEntry(s)
+    if logCount < LOG_BUFFER_SIZE then
+        logBuffer[logCount+1] = s
+        logCount = logCount + 1
+    else
+        logBuffer[logStart] = s
+        logStart = logStart % LOG_BUFFER_SIZE + 1
     end
-    return false
 end
-local function nearestHorse()
-    local char = LocalPlayer.Character
-    if not char then return nil end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-    local best, bestd = nil, math.huge
-    for _, m in ipairs(workspace:GetDescendants()) do
-        if m:IsA("Model") and looksHorsey(m) then
-            local hrp = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("UpperTorso") or m:FindFirstChild("Torso")
-            if hrp and hrp:IsA("BasePart") then
-                local d = (hrp.Position - root.Position).Magnitude
-                if d < bestd then bestd, best = d, m end
+
+-- safe serializer (limited depth & items)
+local function safeDump(val, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    if depth > DEPTH_LIMIT then
+        return "...(depth limit)"
+    end
+
+    local t = typeof(val)
+    if t == "table" then
+        if seen[val] then return "{<cycle>}" end
+        seen[val] = true
+        local out = {"{"}
+        local added = 0
+        for k,v in pairs(val) do
+            added = added + 1
+            if added > MAX_ITEMS_PER_TABLE then
+                table.insert(out, " ... (truncated) }")
+                break
             end
+            table.insert(out, ("\n%s[%s] = %s"):format(string.rep("  ", depth+1), tostring(k), safeDump(v, depth+1, seen)))
         end
-    end
-    return best
-end
-
--- equip lasso if you have one
-local function equipLasso()
-    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-    local function isLasso(tool)
-        local n = (tool and tool.Name or ""):lower()
-        return n:find("lasso",1,true) or n:find("rope",1,true)
-    end
-    if LocalPlayer.Character then
-        for _,t in ipairs(LocalPlayer.Character:GetChildren()) do
-            if t:IsA("Tool") and isLasso(t) then return t end
-        end
-    end
-    if backpack then
-        for _,t in ipairs(backpack:GetChildren()) do
-            if t:IsA("Tool") and isLasso(t) then
-                t.Parent = LocalPlayer.Character
-                task.wait()
-                return t
+        table.insert(out, "\n" .. string.rep("  ", depth) .. "}")
+        return table.concat(out)
+    elseif t == "Instance" then
+        -- summary only
+        if SKIP_INSTANCE_DETAILS then
+            -- try to detect Character-like instances to reduce noise
+            local name = val.Name or ""
+            local class = val.ClassName or "Instance"
+            if val:FindFirstChild("Humanoid") or string.match(name, "Character") then
+                return ("Instance<%s>(%s)"):format(class, tostring(name))
+            else
+                return ("Instance<%s>:%s"):format(class, val:GetFullName() or tostring(name))
             end
+        else
+            return "Instance<"..val.ClassName..">:"..(val:GetFullName() or tostring(val))
         end
+    elseif t == "function" then
+        return "function(" .. tostring(val) .. ")"
+    else
+        local ok, s = pcall(function() return tostring(val) end)
+        s = ok and s or "<tostring failed>"
+        if #s > 200 then s = s:sub(1,200) .. "...(truncated)" end
+        return t .. "(" .. s .. ")"
     end
 end
 
--- build new args from the last captured _hit
-local function buildArgsFor(horse)
-    local last = _G.LASSO_LASTARGS__hit
-    local hitFn = _G.__HitCompact_wrapped  -- original _hit function reference recorded by HitCompact
-    if not last or not last.n or not hitFn then
-        warn("[AutoTame] Need at least one [_hit] capture and HitCompact running.")
-        return nil, nil
+-- push and optionally print
+local function logf(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        table.insert(parts, safeDump(v))
     end
-    local a1 = copy(last[1] or {})
-    local a2 = copy(last[2] or {})
-    local hrp = horse and (horse:FindFirstChild("HumanoidRootPart") or horse:FindFirstChild("UpperTorso") or horse:FindFirstChild("Torso"))
-
-    -- refresh obvious fields in a1 (your side)
-    local char = LocalPlayer.Character
-    if char then a1.Character = char end
-    a1.Player = LocalPlayer
-    a1.Owner  = a1.Owner or LocalPlayer
-
-    -- ensure we have a lasso tool in a1 if the template had it
-    if a1.Tool == nil then
-        local tool = equipLasso()
-        if tool then a1.Tool = tool end
-    end
-
-    -- refresh target fields in a2
-    if horse then
-        a2.Model = horse
-        if hrp then
-            a2.HumanoidRootPart = hrp
-            a2.HRP = hrp
-        end
-    end
-
-    -- new hit position
-    local a3 = hrp and hrp.Position or last[3]
-
-    return {a1, a2, a3}, hitFn
+    local line = table.concat(parts, "\t")
+    pushLogEntry(line)
+    -- you can still print a short summary to Output:
+    print("[SpyShort] ".. (line:sub(1,200)))
 end
 
--- public: try to tame the nearest horse now
-_G.AutoTameNearest = function()
-    local horse = nearestHorse()
-    if not horse then
-        print("[AutoTame] No horse nearby.")
-        return
-    end
-    equipLasso()
-    local pack, hitFn = buildArgsFor(horse)
-    if not pack then return end
-    print(("[AutoTame] Calling _hit with: a1[tool=%s]  a2[model=%s]  a3=%s")
-        :format(tostring(pack[1].Tool), tostring(pack[2].Model), tostring(pack[3])))
-    -- call _hit (will also print one compact [_hit] line from the logger)
-    local ok, err = pcall(function()
-        return hitFn(pack[1], pack[2], pack[3])
+-- UI: simple scrolling UI that shows buffer
+local function createLogUI()
+    local player = Players.LocalPlayer
+    if not player then return end
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "SpyLogUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = player:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame", screenGui)
+    frame.AnchorPoint = Vector2.new(1,1)
+    frame.Position = UDim2.new(1,1,1, -40) -- bottom-right corner
+    frame.Size = UDim2.new(0.45, 0, 0.4, 0)
+    frame.BackgroundTransparency = 0.25
+
+    local scroll = Instance.new("ScrollingFrame", frame)
+    scroll.Size = UDim2.new(1, -10, 1, -10)
+    scroll.Position = UDim2.new(0, 5, 0, 5)
+    scroll.CanvasSize = UDim2.new(0,0,0,0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.VerticalScrollBarInset = Enum.ScrollBarInset.Always
+
+    local uiList = Instance.new("UIListLayout", scroll)
+    uiList.SortOrder = Enum.SortOrder.LayoutOrder
+    uiList.Padding = UDim.new(0, 4)
+
+    -- periodic updater
+    spawn(function()
+        while true do
+            -- build combined text lines from buffer
+            local lines = {}
+            for i = 0, logCount-1 do
+                local idx = ((logStart - 1 + i) % LOG_BUFFER_SIZE) + 1
+                lines[#lines+1] = logBuffer[idx]
+            end
+            -- clear existing children then add latest (keep <= 300 labels to avoid UI heavy)
+            for _,c in ipairs(scroll:GetChildren()) do
+                if c:IsA("TextLabel") then c:Destroy() end
+            end
+            local startIdx = math.max(1, #lines - 300 + 1)
+            for i = startIdx, #lines do
+                local lbl = Instance.new("TextLabel")
+                lbl.BackgroundTransparency = 1
+                lbl.Size = UDim2.new(1, 0, 0, 16)
+                lbl.TextXAlignment = Enum.TextXAlignment.Left
+                lbl.Font = Enum.Font.Code
+                lbl.TextScaled = false
+                lbl.Text = lines[i] or ""
+                lbl.TextColor3 = Color3.new(1,1,1)
+                lbl.TextSize = 14
+                lbl.Parent = scroll
+            end
+            wait(0.5) -- update frequency (tweak as needed)
+        end
     end)
-    if not ok then
-        warn("[AutoTame] _hit call failed: "..tostring(err))
+end
+
+-- wrapper utility (non-invasive, pcall, filter args)
+local function safeWrap(tbl, fnName)
+    if type(tbl[fnName]) == "function" then
+        local old = tbl[fnName]
+        tbl[fnName] = function(...)
+            local args = {...}
+            -- build a filtered summary of args
+            local argSummaries = {}
+            for i,v in ipairs(args) do
+                if not SILENT_ARG_INDEX[i] then
+                    table.insert(argSummaries, ("arg[%d]=%s"):format(i, safeDump(v)))
+                else
+                    table.insert(argSummaries, ("arg[%d]=<skipped>"):format(i))
+                end
+            end
+            logf(("[Spy] %s called: %s"):format(fnName, table.concat(argSummaries, ", ")))
+            local ok, ret1, ret2 = pcall(old, ...)
+            if not ok then
+                logf(("[Spy] %s -> error: %s"):format(fnName, tostring(ret1)))
+            end
+            return ret1, ret2
+        end
+        logf(("[Spy] Wrapped %s"):format(fnName))
+    else
+        logf(("[Spy] %s not a function, type=%s"):format(fnName, typeof(tbl[fnName])))
     end
 end
 
-print("[AutoTame] Loaded. Type AutoTameNearest() when you’re near a horse.")
+-- initialize UI and wrap
+createLogUI()
+if ok and type(Lasso)=="table" then
+    safeWrap(Lasso, "_hit")
+    safeWrap(Lasso, "doLasso")
+else
+    logf("[Spy] Could not require Lasso module.")
+end
