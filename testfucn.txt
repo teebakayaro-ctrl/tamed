@@ -1,117 +1,182 @@
--- Lasso Arg Inspector (doLasso + _hit)
--- Minimal, scoped, nil-safe. Prints only when those two functions run.
+-- Lasso Deep Inspector v2 — finds & wraps local doLasso/_hit by crawling closures/upvalues
+-- Minimal noise: prints only when doLasso/_hit run. Stores last args/returns in globals.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
+-- ---------- helpers ----------
+local function full(i) local ok,f=pcall(function() return i:GetFullName() end); return ok and f or tostring(i) end
 local function pretty(v)
     local t = typeof(v)
-    if t == "Instance" then
-        local okN, nm = pcall(function() return v.Name end)
-        local okF, fm = pcall(function() return v:GetFullName() end)
-        return string.format("<%s:%s%s>", v.ClassName, okN and nm or "?", okF and (" @"..fm) or "")
-    elseif t == "Vector3" or t == "CFrame" or t == "Vector2" or t == "UDim2" or t == "Color3" then
-        return tostring(v)
+    if t=="Instance" then
+        local okN,nm=pcall(function() return v.Name end)
+        return ("<%s:%s>"):format(v.ClassName, okN and nm or "?")
     else
-        local ok, s = pcall(function() return tostring(v) end)
+        local ok,s=pcall(function() return tostring(v) end)
         return ok and s or ("<"..t..">")
     end
 end
-
-local function packArgs(...)
-    local p = table.pack(...)
+local function packArgs(...) local p=table.pack(...); return p end
+local function previewPack(p, cap)
+    cap = cap or 5
+    local n = p.n or #p
     local parts = {}
-    for i = 1, p.n do parts[i] = string.format("[%d] %s", i, pretty(p[i])) end
-    return p, table.concat(parts, "  ")
+    for i=1, math.min(n, cap) do parts[i] = ("[%d] %s"):format(i, pretty(p[i])) end
+    if n > cap then parts[#parts+1] = ("...(+%d)"):format(n-cap) end
+    return table.concat(parts, "  ")
 end
 
-local function findLassoModule()
-    local root = ReplicatedStorage:FindFirstChild("_replicationFolder", true)
-    if not root then return nil, "No _replicationFolder" end
-    local m = root:FindFirstChild("Lasso", true)
-    if not m then return nil, "No Lasso ModuleScript" end
-    if not m:IsA("ModuleScript") then return nil, "Lasso is not ModuleScript" end
-    return m
+-- ---------- locate modules ----------
+local root = ReplicatedStorage:FindFirstChild("_replicationFolder", true)
+if not root then return warn("[LDI] _replicationFolder not found") end
+
+local lassoMS = root:FindFirstChild("Lasso", true)
+if not (lassoMS and lassoMS:IsA("ModuleScript")) then return warn("[LDI] Lasso ModuleScript not found") end
+
+local mobMS = root:FindFirstChild("MobAnimator", true) -- seen in your stack
+-- mobMS optional; we’ll use it if available
+
+local okL, LassoRet = pcall(require, lassoMS)
+if not okL then return warn("[LDI] require(Lasso) failed: "..tostring(LassoRet)) end
+
+local okM, MobRet = true, nil
+if mobMS then okM, MobRet = pcall(require, mobMS) end
+
+local LASSO_SRC = lassoMS:GetFullName() -- used to match debug.info(fn,"s")
+
+-- ---------- closure crawler ----------
+local seenFunc, seenTable = {}, {}
+local owners = {}        -- map: targetFn -> list of {kind="upvalue"/"table", owner=function/table, keyOrIndex=...}
+local targets = { }      -- map name -> function (we keep both doLasso and _hit if found)
+
+local function markOwner(targetFn, kind, owner, keyOrIndex)
+    owners[targetFn] = owners[targetFn] or {}
+    table.insert(owners[targetFn], {kind=kind, owner=owner, key=keyOrIndex})
 end
 
-local lassoMS, why = findLassoModule()
-if not lassoMS then
-    return warn("[Lasso-Inspector] "..why)
-end
-
-local okReq, Lasso = pcall(require, lassoMS)
-if not okReq then
-    return warn("[Lasso-Inspector] require() failed: "..tostring(Lasso))
-end
-
-if type(Lasso) ~= "table" then
-    return warn("[Lasso-Inspector] require() did not return a table")
-end
-
-if Lasso.__inspector_wrapped then
-    print("[Lasso-Inspector] Already wrapped.")
-    return
-end
-
--- Wrap doLasso
-local orig_do = rawget(Lasso, "doLasso")
-if type(orig_do) ~= "function" then
-    warn("[Lasso-Inspector] Lasso.doLasso not found (function). Did the game obfuscate/rename it?")
-else
-    local nparams, isvar = debug.info(orig_do, "a")
-    print(string.format("[Lasso-Inspector] Found doLasso  params=%s  vararg=%s", tostring(nparams), tostring(isvar)))
-
-    Lasso.doLasso = function(...)
-        local args, preview = packArgs(...)
-        _G.LASSO_LASTARGS_doLasso = args
-        print("[doLasso] args ->  "..preview)
-        local r = table.pack(orig_do(...))
-        _G.LASSO_LASTRET_doLasso = r
-        if r.n > 0 then
-            local parts = {}
-            for i=1, r.n do parts[i] = string.format("[%d] %s", i, pretty(r[i])) end
-            print("[doLasso] returns ->  "..table.concat(parts, "  "))
-        end
-        return table.unpack(r, 1, r.n)
-    end
-
-    -- Try to locate and wrap private _hit via doLasso upvalues
-    local wrappedHit = false
-    local i = 1
-    while true do
-        local name, val = debug.getupvalue(orig_do, i)
-        if not name then break end
-        if type(val) == "function" then
-            -- match by upvalue name OR by function debug name
-            local fname = debug.info(val, "n") or ""
-            if name == "_hit" or (type(fname)=="string" and fname:find("_hit", 1, true)) then
-                local orig_hit = val
-                local hp, hvar = debug.info(orig_hit, "a")
-                print(string.format("[Lasso-Inspector] Found _hit via upvalue #%d  params=%s  vararg=%s", i, tostring(hp), tostring(hvar)))
-                local wrapper = function(...)
-                    local a, prev = packArgs(...)
-                    _G.LASSO_LASTARGS__hit = a
-                    print("[_hit] args ->  "..prev)
-                    local rr = table.pack(orig_hit(...))
-                    _G.LASSO_LASTRET__hit = rr
-                    if rr.n > 0 then
-                        local parts = {}
-                        for k=1, rr.n do parts[k] = string.format("[%d] %s", k, pretty(rr[k])) end
-                        print("[_hit] returns ->  "..table.concat(parts, "  "))
+local function crawlValue(val, fromKind, owner, key)
+    local t = typeof(val)
+    if t == "table" then
+        if seenTable[val] then return end
+        seenTable[val] = true
+        for k,v in pairs(val) do
+            if typeof(v) == "function" then
+                -- record table slot in case this is target later
+                local src = debug.info(v, "s") or ""
+                local nm  = debug.info(v, "n") or ""
+                if type(nm)=="string" and #nm>0 and src:find(LASSO_SRC, 1, true) then
+                    -- candidate by name & source
+                    if nm=="doLasso" or nm=="_hit" then
+                        targets[nm] = targets[nm] or v
+                        markOwner(v, "table", val, k)
                     end
-                    return table.unpack(rr, 1, rr.n)
                 end
-                debug.setupvalue(orig_do, i, wrapper)
-                wrappedHit = true
-                break
+            end
+            crawlValue(v, "table", val, k)
+        end
+    elseif t == "function" then
+        if seenFunc[val] then return end
+        seenFunc[val] = true
+
+        -- identify functions that belong to the Lasso module by source
+        local src = debug.info(val, "s") or ""
+        local nm  = debug.info(val, "n") or ""
+        if src:find(LASSO_SRC, 1, true) then
+            -- if we arrived here from a table/owner, remember the slot; we’ll also scan upvalues
+            if (nm=="doLasso" or nm=="_hit") and owner ~= nil then
+                -- record this function reference back to its container
+                markOwner(val, fromKind, owner, key)
+                targets[nm] = targets[nm] or val
             end
         end
-        i += 1
-    end
-    if not wrappedHit then
-        warn("[Lasso-Inspector] Could not locate _hit upvalue from doLasso. It might not be referenced directly.")
+
+        -- crawl upvalues; also watch for upvalue names matching doLasso/_hit
+        local i = 1
+        while true do
+            local upName, upVal = debug.getupvalue(val, i)
+            if not upName then break end
+            if typeof(upVal) == "function" then
+                local usrc = debug.info(upVal, "s") or ""
+                local un   = debug.info(upVal, "n") or ""
+                if usrc:find(LASSO_SRC, 1, true) then
+                    if upName=="doLasso" or upName=="_hit" or un=="doLasso" or un=="_hit" then
+                        targets[upName=="doLasso" and "doLasso" or (upName=="_hit" and "_hit" or (un~="" and un or upName))] = targets[upName] or upVal
+                        markOwner(upVal, "upvalue", val, i) -- upvalue slot to replace
+                    end
+                end
+            end
+            -- continue crawling
+            crawlValue(upVal, "upvalue", val, i)
+            i = i + 1
+        end
     end
 end
 
-Lasso.__inspector_wrapped = true
-print("[Lasso-Inspector] Ready. Perform one real lasso/tame; you’ll see clean arg prints for doLasso and _hit.")
-print("[Lasso-Inspector] Last-captured args are in _G.LASSO_LASTARGS_doLasso and _G.LASSO_LASTARGS__hit.")
+-- seed the crawl with everything reachable from both require returns
+crawlValue(LassoRet, "root", nil, nil)
+if okM and MobRet ~= nil then crawlValue(MobRet, "root", nil, nil) end
+
+-- if names not yet found, still attempt: any function from Lasso source reachable?
+if not targets.doLasso or not targets._hit then
+    for fn,_ in pairs(seenFunc) do
+        local src = debug.info(fn,"s") or ""
+        local nm  = debug.info(fn,"n") or ""
+        if src:find(LASSO_SRC,1,true) then
+            if nm=="doLasso" then targets.doLasso = targets.doLasso or fn end
+            if nm=="_hit"    then targets._hit    = targets._hit    or fn end
+        end
+    end
+end
+
+-- ---------- install wrappers ----------
+local function makeWrapper(name, orig)
+    local pCount, isVar = debug.info(orig, "a")
+    print(("[LDI] Wrapping %s  params=%s vararg=%s"):format(name, tostring(pCount), tostring(isVar)))
+    return function(...)
+        local args = packArgs(...)
+        _G["LASSO_LASTARGS_"..name] = args
+        print(("[%s] args -> %s"):format(name, previewPack(args, 6)))
+        local ret = table.pack(orig(...))
+        _G["LASSO_LASTRET_"..name] = ret
+        if ret.n > 0 then
+            print(("[%s] returns -> %s"):format(name, previewPack(ret, 6)))
+        end
+        return table.unpack(ret, 1, ret.n)
+    end
+end
+
+local function replaceEverywhere(targetName, targetFn)
+    if not targetFn then return end
+    local wrapper = makeWrapper(targetName, targetFn)
+
+    -- 1) Try hookfunction if executor supports it
+    local okHook = false
+    if type(hookfunction)=="function" then
+        local ok, err = pcall(function() hookfunction(targetFn, wrapper) end)
+        okHook = ok
+    end
+
+    -- 2) Also patch all recorded owners (upvalue/table slots) so references update
+    if owners[targetFn] then
+        for _, ref in ipairs(owners[targetFn]) do
+            if ref.kind == "table" and typeof(ref.owner)=="table" then
+                pcall(function() ref.owner[ref.key] = wrapper end)
+            elseif ref.kind == "upvalue" and typeof(ref.owner)=="function" then
+                pcall(function() debug.setupvalue(ref.owner, ref.key, wrapper) end)
+            end
+        end
+    end
+
+    if okHook then
+        print(("[LDI] Hooked %s via hookfunction + patched refs."):format(targetName))
+    else
+        print(("[LDI] Patched %s via upvalues/tables (hookfunction unavailable or blocked)."):format(targetName))
+    end
+end
+
+if not targets.doLasso and not targets._hit then
+    print("[LDI] Couldn’t locate doLasso/_hit through reachable closures. Try triggering the lasso once, then run this again.")
+else
+    if targets.doLasso then replaceEverywhere("doLasso", targets.doLasso) else print("[LDI] doLasso not found (yet).") end
+    if targets._hit    then replaceEverywhere("_hit",    targets._hit)    else print("[LDI] _hit not found (yet).")    end
+    print("[LDI] Ready. Do one real lasso/tame; exact args/returns will print once, then you can reuse _G.LASSO_LASTARGS_doLasso / _hit.")
+end
