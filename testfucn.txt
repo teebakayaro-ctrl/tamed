@@ -1,48 +1,61 @@
+-- LassoArg13Spy.client.lua
 local RS = game:GetService("ReplicatedStorage")
 local repFolder = RS:WaitForChild("_replicationFolder")
 local ok, Lasso = pcall(require, repFolder:WaitForChild("Lasso"))
 
--- Pretty dumper for any value
-local function dump(val, depth, seen)
-	depth = depth or 0
-	seen = seen or {}
-	local t = typeof(val)
+-- dumper สั้น ๆ ไม่สแปม
+local function brief(v, depth, seen)
+	depth = depth or 0; seen = seen or {}
+	local t = typeof(v)
 	if t == "table" then
-		if seen[val] then return "{<cycle>}" end
-		seen[val] = true
-		local out = {"{\n"}
-		for k,v in pairs(val) do
-			table.insert(out, string.rep("  ", depth+1) .. "["..tostring(k).."] = " .. dump(v, depth+1, seen) .. "\n")
+		if seen[v] then return "{<cycle>}" end
+		seen[v] = true
+		local keys, n = {}, 0
+		for k,_ in pairs(v) do
+			n += 1
+			if #keys < 6 then table.insert(keys, tostring(k)) end
 		end
-		table.insert(out, string.rep("  ", depth).."}")
-		return table.concat(out)
+		return "table{"..table.concat(keys,",")..(n > 6 and ",..." or "").."}"
 	elseif t == "Instance" then
-		return "Instance<"..val.ClassName..">:"..val:GetFullName()
+		return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
 	else
-		return t.."("..tostring(val)..")"
+		return ("%s(%s)"):format(t, tostring(v))
+	end
+end
+
+local function printOnly13(args)
+	-- arg[1]
+	if args[1] ~= nil then
+		print(" arg[1] = "..brief(args[1]))
+	end
+	-- arg[3] (ถ้ามี)
+	if args[3] ~= nil then
+		print(" arg[3] = "..brief(args[3]))
 	end
 end
 
 local function safeWrap(tbl, fnName)
-	if type(tbl[fnName]) == "function" then
-		local old = tbl[fnName]
-		tbl[fnName] = function(...)
-			print("[Spy] "..fnName.." called:")
-			local args = {...}
-			for i,v in ipairs(args) do
-				if i ~= 2 then 
-					print(" arg["..i.."] = "..dump(v))
-				end
-			end
-			return old(...)
-		end
-		print("[Spy] Wrapped "..fnName)
-	else
-		print("[Spy] "..fnName.." not a function, type="..typeof(tbl[fnName]))
+	local f = tbl and tbl[fnName]
+	if type(f) ~= "function" then
+		print(("[Spy] %s not a function (type=%s)"):format(fnName, typeof(f)))
+		return
 	end
+	tbl[fnName] = function(...)
+		local a = {...}
+		print("[Spy] "..fnName.." called:")
+		printOnly13(a)
+		-- เรียกของเดิมแบบปลอดภัย
+		local okCall, r1, r2, r3, r4 = pcall(f, table.unpack(a))
+		if not okCall then
+			warn("[Spy] "..fnName.." error: ", r1)
+			return nil
+		end
+		return r1, r2, r3, r4
+	end
+	print("[Spy] Wrapped "..fnName.." (printing only arg[1], arg[3])")
 end
 
-if ok and type(Lasso)=="table" then
+if ok and type(Lasso) == "table" then
 	safeWrap(Lasso, "_hit")
 	safeWrap(Lasso, "doLasso")
 else
