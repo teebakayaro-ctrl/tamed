@@ -1,262 +1,360 @@
--- SCOPED TAME SPY v2.0 (nil-safe, minimal deps)
--- Focused logging for Horse/Lasso/Tame/Catch/Hit/etc.
--- Uses hookmetamethod if available, otherwise raw __namecall if safe.
+-- TameAssistant v3 — Quiet Scout + Auto (nil-safe, minimal noise)
+-- Goal: find the EXACT tame/lasso remote and drive it with nearest horse target.
 
--- ===== CONFIG =====
-local MAX_LOGS = 600
-local PREVIEW_MAX = 5
+-- ========= CONFIG (edit if you like) =========
+local CAPTURE_SECONDS = 6
+local KEYWORDS = { "tame","lasso","doLasso","horse","mount","ride","catch","rope","break","buck" } -- lower-case match
+local SCOPES = { "ReplicatedStorage._replicationFolder", "ReplicatedStorage.Remotes" } -- path scopes
+local HORSE_NAME_HINTS = { "Horse","Mustang","Stallion","Bronco" } -- model name hints
+local USE_TP_ASSIST = true -- toggle with F6
+local PRINT_TOP_N = 5
 
--- default keywords (receiver path OR args must match one of these, case-insensitive)
-local KEYWORDS = {
-    "lasso","tame","horse","stallion","mustang","mount","ride","catch","rope","doLasso","hit",
-    "buck","break","bridle","halter"
-}
--- optional path scopes (only log if receiver full path contains one of these; leave empty to ignore)
-local PATH_SCOPES = {
-    "ReplicatedStorage._replicationFolder",
-    "ReplicatedStorage.Remotes",
-    "Workspace",
-}
+-- ========= SERVICES =========
+local Players = game:GetService("Players")
+local RS = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
 
--- capture window (set >0 to log only while window active)
-local captureUntil = 0 -- os.clock() seconds; use TameSpyStartWindow(8) to arm for 8s
+-- ========= STATE =========
+local captureUntil = 0
+local seen = {}                 -- [RemoteInstance] = {path=..., name=..., class=..., n=..., lastArgsPreview=...}
+local ordered = {}              -- array of instances for stable ordering
+local bestCache = nil           -- cached best candidates
+local TeleportRemote = nil      -- optional: if your game has it, we’ll use it
 
--- ====== internals ======
-local has_hook = type(hookmetamethod) == "function"
-local has_getname = type(getnamecallmethod) == "function"
-local has_check = type(checkcaller) == "function"
-local getNC = has_getname and getnamecallmethod or function() return "" end
-local isCaller = has_check and checkcaller or function() return false end
-
-_G.TAME_SPY_LOGS = _G.TAME_SPY_LOGS or {}
-
-local function pushLog(e)
-    table.insert(_G.TAME_SPY_LOGS, 1, e)
-    if #_G.TAME_SPY_LOGS > MAX_LOGS then
-        for i=MAX_LOGS+1, #_G.TAME_SPY_LOGS do _G.TAME_SPY_LOGS[i] = nil end
-    end
+-- ========= UTILS =========
+local function toLower(s) local ok,x=pcall(string.lower,s) return ok and x or tostring(s) end
+local function anyMatchLower(str, list)
+    if not str then return false end
+    local low = toLower(str)
+    for _, w in ipairs(list) do if low:find(w, 1, true) then return true end end
+    return false
 end
-
-local function safeToStr(v)
-    local t = typeof(v)
-    if t == "Instance" then
-        local ok, full = pcall(function() return v:GetFullName() end)
-        return ok and ("<%s:%s>"):format(v.ClassName, full) or ("<%s>"):format(v.ClassName)
-    end
-    local ok, s = pcall(function() return tostring(v) end)
-    return ok and s or ("<unprintable:"..t..">")
+local function inScopes(path)
+    if #SCOPES == 0 then return true end
+    for _, s in ipairs(SCOPES) do if path:find(s, 1, true) then return true end end
+    return false
 end
-
-local function previewFromPack(p)
+local function full(inst)
+    local ok, f = pcall(function() return inst:GetFullName() end)
+    return ok and f or tostring(inst)
+end
+local function argPreviewFromPack(p, cap)
+    cap = cap or 4
     local n = p.n or #p
     local parts = {}
-    local cap = math.min(n, PREVIEW_MAX)
-    for i=1, cap do parts[i] = safeToStr(p[i]) end
-    if n > PREVIEW_MAX then parts[#parts+1] = ("...(+%d)"):format(n - PREVIEW_MAX) end
+    for i = 1, math.min(n, cap) do
+        local v = p[i]
+        local t = typeof(v)
+        if t == "Instance" then
+            parts[#parts+1] = ("<%s:%s>"):format(v.ClassName, (pcall(function() return v.Name end) and v.Name) or "?")
+        else
+            local ok, s = pcall(function() return tostring(v) end)
+            parts[#parts+1] = ok and s or ("<"..t..">")
+        end
+    end
+    if n > cap then parts[#parts+1] = ("...(+%d)"):format(n-cap) end
     return table.concat(parts, ", ")
 end
 
-local function toLower(s)
-    if not s then return "" end
-    local ok, low = pcall(string.lower, s)
-    return ok and low or tostring(s)
-end
+-- find optional Teleport remote now
+pcall(function()
+    local rem = ReplicatedStorage:FindFirstChild("Remotes")
+    if rem then
+        TeleportRemote = rem:FindFirstChild("TeleportRemote", true)
+    end
+    if not TeleportRemote then
+        local r = ReplicatedStorage:FindFirstChild("_replicationFolder")
+        if r then TeleportRemote = r:FindFirstChild("TeleportRemote", true) end
+    end
+end)
 
-local function anyMatchLower(str, list)
-    if not str or #list == 0 then return false end
-    local low = toLower(str)
-    for _, kw in ipairs(list) do
-        if low:find(kw, 1, true) then return true end
+-- ========= HORSE FINDER =========
+local function isHorseModel(m)
+    local n = (m and m.Name) or ""
+    for _, hint in ipairs(HORSE_NAME_HINTS) do
+        if n:lower():find(hint:lower(), 1, true) then return true end
     end
     return false
 end
 
-local function argsContainKeyword(pack, list)
-    local n = pack.n or #pack
-    for i=1, n do
-        local v = pack[i]
-        -- check common arg types for textual hints
-        if type(v) == "string" then
-            if anyMatchLower(v, list) then return true end
-        elseif typeof(v) == "Instance" then
-            local ok, name = pcall(function() return v.Name end)
-            if ok and anyMatchLower(name, list) then return true end
-            local ok2, full = pcall(function() return v:GetFullName() end)
-            if ok2 and anyMatchLower(full, list) then return true end
+local function nearestHorse()
+    local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local best, bestd = nil, math.huge
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Model") and isHorseModel(d) then
+            local hrp = d:FindFirstChild("HumanoidRootPart") or d:FindFirstChild("Torso") or d:FindFirstChild("UpperTorso")
+            if hrp and hrp:IsA("BasePart") then
+                local ok, mag = pcall(function() return (hrp.Position - root.Position).Magnitude end)
+                if ok and mag < bestd then bestd, best = mag, d end
+            end
         end
     end
-    return false
+    return best
 end
 
-local function inPathScopes(fullname)
-    if #PATH_SCOPES == 0 then return true end
-    for _, scope in ipairs(PATH_SCOPES) do
-        if fullname:find(scope, 1, true) then return true end
-    end
-    return false
-end
+-- ========= QUIET SCOUT (namecall hook) =========
+local hasHook = (type(hookmetamethod)=="function")
+local hasGetNC = (type(getnamecallmethod)=="function")
+local getNC = hasGetNC and getnamecallmethod or function() return "" end
 
-local function shouldLog(self, method, pack)
-    -- only during capture window if armed
-    if captureUntil > 0 and os.clock() > captureUntil then
-        captureUntil = 0
-    end
-    if captureUntil > 0 then
-        -- in window: still enforce keyword/path so it's not insane
-        -- (comment next line if you want "all in window")
-        -- return true
-    end
-
-    -- gate on remote method class
+local function shouldWatch(self, method, pack)
+    if captureUntil <= 0 or os.clock() > captureUntil then return false end
     if not (method == "FireServer" or method == "InvokeServer" or method == "FireClient" or method == "InvokeClient" or method == "FireAllClients") then
         return false
     end
-
-    -- receiver path & name checks
-    local full = (typeof(self) == "Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or ""
-    local name = (typeof(self) == "Instance" and self.Name) or ""
-    if not inPathScopes(full) then return false end
-
-    -- keyword match: receiver name/path OR args must mention keywords
-    local lowerList = KEYWORDS -- already lower in config
-    if anyMatchLower(full, lowerList) or anyMatchLower(name, lowerList) or argsContainKeyword(pack, lowerList) then
-        return true
+    if typeof(self) ~= "Instance" then return false end
+    local path = full(self)
+    if not inScopes(path) then return false end
+    -- Keyword checks on receiver or args
+    if anyMatchLower(self.Name, KEYWORDS) or anyMatchLower(path, KEYWORDS) then return true end
+    local n = pack.n or #pack
+    for i=1, n do
+        local v = pack[i]
+        if type(v)=="string" and anyMatchLower(v, KEYWORDS) then return true end
+        if typeof(v)=="Instance" then
+            if anyMatchLower(v.Name, KEYWORDS) then return true end
+            local ok, f = pcall(function() return v:GetFullName() end)
+            if ok and anyMatchLower(f, KEYWORDS) then return true end
+        end
     end
     return false
 end
 
-local function shortPrint(e)
-    local ts = os.date("%H:%M:%S", e.time or os.time())
-    print(("[TAME-SPY][%s] %s -> %s | [%s]%s"):format(
-        ts, e.receiver or "?", e.method or "?", e.argsPreview or "",
-        e.returnsPreview and (" | ret=["..e.returnsPreview.."]") or ""
-    ))
+local function scoreRemote(rec)
+    -- higher if name/path has key terms; slight boost for Invoke; frequency also matters
+    local name = toLower(rec.name or "")
+    local path = toLower(rec.path or "")
+    local s = 0
+    for _,k in ipairs(KEYWORDS) do
+        if name:find(k,1,true) then s = s + 5 end
+        if path:find(k,1,true) then s = s + 3 end
+    end
+    if rec.methodSeenInvoke then s = s + 2 end
+    s = s + math.min(rec.n or 0, 5)
+    return s
 end
 
--- ===== hooking =====
-local hooked = false
+local function pickBest()
+    bestCache = nil
+    if #ordered == 0 then return nil end
+    table.sort(ordered, function(a, b)
+        local sa = scoreRemote(seen[a])
+        local sb = scoreRemote(seen[b])
+        if sa == sb then
+            return (seen[a].n or 0) > (seen[b].n or 0)
+        end
+        return sa > sb
+    end)
+    bestCache = {}
+    -- collect top matches with strong scores
+    for i=1, math.min(3, #ordered) do
+        table.insert(bestCache, ordered[i])
+    end
+    return bestCache
+end
 
-if has_hook then
-    local original = hookmetamethod(game, "__namecall", function(self, ...)
-        local m = getNC()
-        local pack = table.pack(...)
-        if shouldLog(self, m, pack) then
-            local entry = {
-                time = os.time(),
-                method = m,
-                receiver = (typeof(self) == "Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or tostring(self),
-                class = (typeof(self) == "Instance" and self.ClassName) or typeof(self),
-                argsPreview = previewFromPack(pack),
-                originIsScript = isCaller(),
-            }
-            if m:sub(1,6) == "Invoke" then
-                local ok, r1, r2, r3 = pcall(original, self, ...)
-                if ok then entry.returnsPreview = previewFromPack(table.pack(r1, r2, r3)) end
-                pushLog(entry); shortPrint(entry)
-                if ok then return r1, r2, r3 else error(tostring(r1)) end
-            else
-                local ok, err = pcall(original, self, ...)
-                pushLog(entry); shortPrint(entry)
-                if not ok then warn("[TAME-SPY] Fire* forward error: "..tostring(err)) end
-                return
+local function startCapture(sec)
+    captureUntil = os.clock() + (sec or CAPTURE_SECONDS)
+end
+
+-- Hook (quiet; no prints during capture)
+do
+    if hasHook then
+        local orig = hookmetamethod(game, "__namecall", function(self, ...)
+            local m = getNC()
+            if captureUntil > 0 and shouldWatch(self, m, table.pack(...)) then
+                local key = self
+                if not seen[key] then
+                    seen[key] = {
+                        path = full(self), name = self.Name, class = self.ClassName,
+                        n = 0, lastArgsPreview = "", methodSeenInvoke = false
+                    }
+                    table.insert(ordered, key)
+                end
+                local rec = seen[key]
+                rec.n = rec.n + 1
+                rec.lastArgsPreview = argPreviewFromPack(table.pack(...), 4)
+                if m:sub(1,6) == "Invoke" then rec.methodSeenInvoke = true end
+            end
+            return orig(self, ...)
+        end)
+        if type(orig) ~= "function" then
+            warn("[TameAssistant] hookmetamethod orig nil; scout disabled.")
+        end
+    else
+        warn("[TameAssistant] hookmetamethod not available; scout disabled.")
+    end
+end
+
+-- ========= SUMMARY PRINTER =========
+local function printSummary()
+    local best = pickBest()
+    if not best or #best == 0 then
+        print("[TameAssistant] No candidates captured yet. Press F8, do the tame, then F9.")
+        return
+    end
+    print("=== TameAssistant: Top candidates ===")
+    for i, inst in ipairs(best) do
+        local r = seen[inst]
+        print(("%d) %s (%s)"):format(i, r.name, r.class))
+        print(("    path: %s"):format(r.path))
+        print(("    seen: %d   lastArgs: [%s]%s"):format(r.n or 0, r.lastArgsPreview or "", r.methodSeenInvoke and "   (has Invoke)" or ""))
+        if i >= PRINT_TOP_N then break end
+    end
+    print("=== end ===")
+end
+
+-- ========= EQUIP LASSO / TOOL HELPERS =========
+local function equipToolByHint(hints)
+    local char = LocalPlayer.Character
+    if not char then return false end
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local tool = nil
+    if backpack then
+        for _, t in ipairs(backpack:GetChildren()) do
+            if t:IsA("Tool") then
+                local nm = t.Name:lower()
+                for _,h in ipairs(hints) do
+                    if nm:find(h,1,true) then tool = t break end
+                end
+                if tool then break end
             end
         end
-        return original(self, ...)
-    end)
-    if type(original) == "function" then hooked = true else warn("[TAME-SPY] hookmetamethod returned nil; fallback…") end
+    end
+    if not tool then
+        -- maybe already equipped
+        for _, t in ipairs(char:GetChildren()) do
+            if t:IsA("Tool") then
+                local nm = t.Name:lower()
+                for _,h in ipairs(hints) do
+                    if nm:find(h,1,true) then tool = t break end
+                end
+                if tool then break end
+            end
+        end
+    end
+    if not tool then return false end
+    -- Equip
+    pcall(function() tool.Parent = char end)
+    return true
 end
 
-if not hooked then
-    local ok_mt, mt = pcall(getrawmetatable, game)
-    if ok_mt and mt and type(mt.__namecall) == "function" then
-        local old = mt.__namecall
-        pcall(setreadonly, mt, false)
-        mt.__namecall = (type(newcclosure) == "function" and newcclosure or function(f) return f end)(function(self, ...)
-            local m = getNC()
-            local pack = table.pack(...)
-            if shouldLog(self, m, pack) then
-                local entry = {
-                    time = os.time(),
-                    method = m,
-                    receiver = (typeof(self) == "Instance" and (pcall(function() return self:GetFullName() end) and self:GetFullName())) or tostring(self),
-                    class = (typeof(self) == "Instance" and self.ClassName) or typeof(self),
-                    argsPreview = previewFromPack(pack),
-                    originIsScript = isCaller(),
-                }
-                if m:sub(1,6) == "Invoke" then
-                    local ok2, r1, r2, r3 = pcall(old, self, ...)
-                    if ok2 then entry.returnsPreview = previewFromPack(table.pack(r1, r2, r3)) end
-                    pushLog(entry); shortPrint(entry)
-                    if ok2 then return r1, r2, r3 else error(tostring(r1)) end
+-- ========= TELEPORT ASSIST (optional) =========
+local function tpToHorse(horse)
+    if not USE_TP_ASSIST or not TeleportRemote or not horse then return end
+    local hrp = horse:FindFirstChild("HumanoidRootPart") or horse:FindFirstChild("Torso") or horse:FindFirstChild("UpperTorso")
+    if not hrp then return end
+    -- Try common arg shapes; all guarded
+    pcall(function() TeleportRemote:FireServer(hrp.Position) end)
+    pcall(function() TeleportRemote:FireServer(hrp.CFrame) end)
+    pcall(function() TeleportRemote:InvokeServer(hrp.Position) end)
+    pcall(function() TeleportRemote:InvokeServer(hrp.CFrame) end)
+end
+
+-- ========= AUTO-TAME SEQUENCER =========
+local function callBestTame(horse)
+    local best = pickBest()
+    if not best or #best == 0 then
+        print("[TameAssistant] No tame candidate found. Capture (F8), do tame, then retry.")
+        return false
+    end
+    -- Build a few plausible arg combos:
+    local argsList = {}
+    -- horse instance
+    if horse then table.insert(argsList, {horse}) end
+    -- horse + position
+    do
+        local hrp = horse and (horse:FindFirstChild("HumanoidRootPart") or horse:FindFirstChild("Torso") or horse:FindFirstChild("UpperTorso"))
+        if hrp then
+            table.insert(argsList, {horse, hrp.Position})
+            table.insert(argsList, {hrp.Position})
+            table.insert(argsList, {hrp.CFrame})
+        end
+    end
+    -- player reference
+    table.insert(argsList, {LocalPlayer})
+    -- (empty) as last resort
+    table.insert(argsList, {})
+
+    local tried = 0
+    for _, inst in ipairs(best) do
+        local r = seen[inst]
+        -- only touch RemoteEvent/RemoteFunction
+        if inst and inst.ClassName=="RemoteEvent" or inst.ClassName=="RemoteFunction" then
+            -- try several arg combos, both FireServer/InvokeServer
+            for _, a in ipairs(argsList) do
+                tried = tried + 1
+                if inst.ClassName=="RemoteEvent" then
+                    local ok = pcall(function() inst:FireServer(unpack(a)) end)
+                    if ok then
+                        print(("[TameAssistant] Fired %s with args=[%s]"):format(r.path, argPreviewFromPack(table.pack(unpack(a)), 4)))
+                        return true
+                    end
                 else
-                    local ok2, err = pcall(old, self, ...)
-                    pushLog(entry); shortPrint(entry)
-                    if not ok2 then warn("[TAME-SPY] Fire* forward error: "..tostring(err)) end
-                    return
+                    local ok, ret = pcall(function() return inst:InvokeServer(unpack(a)) end)
+                    if ok then
+                        print(("[TameAssistant] Invoked %s with args=[%s] ret=%s"):format(r.path, argPreviewFromPack(table.pack(unpack(a)),4), tostring(ret)))
+                        return true
+                    end
                 end
             end
-            return old(self, ...)
-        end)
-        pcall(setreadonly, mt, true)
-        hooked = true
-    end
-end
-
-if hooked then
-    print("[TAME-SPY] Scoped hook active. Watching horse/lasso/tame-related remotes.")
-else
-    warn("[TAME-SPY] Could not hook __namecall; executor may not support interception.")
-end
-
--- ====== runtime controls you can call from console ======
-_G.TameSpySetKeywords = function(list)
-    KEYWORDS = {}
-    for _, w in ipairs(list) do KEYWORDS[#KEYWORDS+1] = string.lower(tostring(w)) end
-    print("[TAME-SPY] keywords set:", table.concat(KEYWORDS, ", "))
-end
-
-_G.TameSpyAddKeywords = function(list)
-    for _, w in ipairs(list) do KEYWORDS[#KEYWORDS+1] = string.lower(tostring(w)) end
-    print("[TAME-SPY] keywords now:", table.concat(KEYWORDS, ", "))
-end
-
-_G.TameSpySetPathScopes = function(scopes)
-    PATH_SCOPES = {}
-    for _, p in ipairs(scopes) do PATH_SCOPES[#PATH_SCOPES+1] = tostring(p) end
-    print("[TAME-SPY] path scopes set:", table.concat(PATH_SCOPES, " | "))
-end
-
-_G.TameSpyStartWindow = function(seconds)
-    captureUntil = os.clock() + (tonumber(seconds) or 6)
-    print(string.format("[TAME-SPY] capture window armed for %.2fs", (tonumber(seconds) or 6)))
-end
-
-_G.TameSpyGet = function(n)
-    n = n or 50
-    local out = {}
-    for i=1, math.min(n, #_G.TAME_SPY_LOGS) do out[i] = _G.TAME_SPY_LOGS[i] end
-    return out
-end
-
-_G.TameSpyFilter = function(substr, n)
-    n = n or 50
-    local res = {}
-    substr = tostring(substr or "")
-    for i=1, #_G.TAME_SPY_LOGS do
-        local e = _G.TAME_SPY_LOGS[i]
-        if e and (
-            (e.receiver and e.receiver:find(substr, 1, true)) or
-            (e.method and e.method:find(substr, 1, true)) or
-            (e.argsPreview and e.argsPreview:find(substr, 1, true))
-        ) then
-            res[#res+1] = e
-            if #res >= n then break end
         end
     end
-    return res
+    print("[TameAssistant] Tried " .. tostring(tried) .. " remote/arg combos; none succeeded (or success is silent).")
+    return false
 end
 
-_G.TameSpyClear = function()
-    _G.TAME_SPY_LOGS = {}
-    print("[TAME-SPY] cleared.")
+local function autoTame()
+    -- Step 1: find target horse
+    local horse = nearestHorse()
+    if not horse then print("[TameAssistant] No horse nearby.") return end
+    print("[TameAssistant] Target:", full(horse))
+
+    -- Step 2: TP assist (optional)
+    tpToHorse(horse)
+
+    -- Step 3: Equip lasso
+    local equipped = equipToolByHint({"lasso","rope"})
+    if equipped then
+        print("[TameAssistant] Lasso equipped.")
+        -- best effort click/activate
+        pcall(function()
+            local char = LocalPlayer.Character
+            local tool = char and char:FindFirstChildOfClass("Tool")
+            if tool and tool.Activate then tool:Activate() end
+        end)
+    else
+        print("[TameAssistant] Could not auto-equip lasso (tool not found). Continuing anyway.")
+    end
+
+    -- Step 4: Call best tame remote we discovered
+    local ok = callBestTame(horse)
+    if not ok then
+        print("[TameAssistant] No success yet. Try another capture; make sure you actually do the lasso/tame during window.")
+    end
 end
+
+-- ========= HOTKEYS =========
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.F8 then
+        seen, ordered, bestCache = {}, {}, nil
+        startCapture(CAPTURE_SECONDS)
+        print(("[TameAssistant] CAPTURE ARMED for %ds. Perform tame now."):format(CAPTURE_SECONDS))
+    elseif input.KeyCode == Enum.KeyCode.F9 then
+        printSummary()
+    elseif input.KeyCode == Enum.KeyCode.F10 then
+        autoTame()
+    elseif input.KeyCode == Enum.KeyCode.F7 then
+        seen, ordered, bestCache = {}, {}, nil
+        print("[TameAssistant] Cleared candidates.")
+    elseif input.KeyCode == Enum.KeyCode.F6 then
+        USE_TP_ASSIST = not USE_TP_ASSIST
+        print("[TameAssistant] TP assist:", USE_TP_ASSIST and "ON" or "OFF")
+    end
+end)
+
+print("[TameAssistant] Loaded. F8=capture, F9=summary, F10=auto-tame, F7=clear, F6=TP assist toggle.")
