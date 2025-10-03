@@ -230,6 +230,106 @@ tameStatus.TextColor3 = Color3.fromRGB(200,200,200)
 tameStatus.Text = "Ready."
 tameStatus.Parent = panel
 
+-- ========= Horse Info Overlay (toggle) =========
+local OVERLAY_ON = false
+
+local overlays: {[Model]: BillboardGui} = {}
+
+local function makeBillboard(): BillboardGui
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "HorseMiniBB"
+	bb.AlwaysOnTop = true
+	bb.Size = UDim2.fromOffset(260, 20)
+	bb.StudsOffset = Vector3.new(0, 4, 0)
+	bb.MaxDistance = 500
+	bb.LightInfluence = 0
+	local txt = Instance.new("TextLabel")
+	txt.Name = "Text"
+	txt.BackgroundTransparency = 1
+	txt.Size = UDim2.fromScale(1, 1)
+	txt.TextXAlignment = Enum.TextXAlignment.Center
+	txt.Font = Enum.Font.Code
+	txt.TextSize = 16
+	txt.TextColor3 = Color3.fromRGB(235,255,235)
+	txt.Text = ""
+	txt.Parent = bb
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.new(0,0,0)
+	stroke.Thickness = 1
+	stroke.Parent = txt
+	return bb
+end
+
+local function ensureOverlay(m: Model): BillboardGui
+	local bb = overlays[m]
+	if bb and bb.Parent then return bb end
+	local root = rootOf(m); if not root then error("no root") end
+	bb = makeBillboard()
+	bb.Adornee = root
+	bb.Parent = m
+	overlays[m] = bb
+	return bb
+end
+
+local function forgetOverlay(m: Model)
+	local bb = overlays[m]
+	if bb then bb:Destroy(); overlays[m] = nil end
+end
+
+local overlayToggle = Instance.new("TextButton")
+overlayToggle.Position = UDim2.new(0, 10, 0, 78)
+overlayToggle.Size = UDim2.new(0, 200, 0, 22)
+overlayToggle.Text = "Overlay: OFF (H)"
+overlayToggle.Font = Enum.Font.Code
+overlayToggle.TextSize = 14
+overlayToggle.BackgroundColor3 = Color3.fromRGB(90,40,40)
+overlayToggle.BorderSizePixel = 0
+overlayToggle.TextColor3 = Color3.fromRGB(240,240,240)
+overlayToggle.Parent = panel
+
+local function setOverlay(v: boolean)
+	OVERLAY_ON = v
+	overlayToggle.Text = v and "Overlay: ON (H)" or "Overlay: OFF (H)"
+	overlayToggle.BackgroundColor3 = v and Color3.fromRGB(40,90,40) or Color3.fromRGB(90,40,40)
+	for _, bb in pairs(overlays) do bb.Enabled = OVERLAY_ON end
+end
+overlayToggle.MouseButton1Click:Connect(function() setOverlay(not OVERLAY_ON) end)
+
+UIS.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == Enum.KeyCode.H then
+		setOverlay(not OVERLAY_ON)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(0.30)
+		local my = myRoot()
+		if not my then continue end
+		local origin = my.Position
+		local seen: {[Model]: boolean} = {}
+		for _, inst in ipairs(workspace:GetDescendants()) do
+			if inst:IsA("Model") and isHorseLike(inst) then
+				local r = rootOf(inst)
+				if r then
+					local dist = (r.Position - origin).Magnitude
+					local bb = ensureOverlay(inst)
+					bb.Enabled = OVERLAY_ON
+					local label = (bb:FindFirstChild("Text") :: TextLabel)
+					label.Text = string.format("%s — %.1f", speciesOf(inst), dist)
+					seen[inst] = true
+				end
+			end
+		end
+		for m in pairs(overlays) do
+			if not m.Parent or not seen[m] then
+				forgetOverlay(m)
+			end
+		end
+	end
+end)
+
 -- ========= Market section (BOTTOM) =========
 -- Hardcoded catalog per your choice
 type LassoItem = { id: string, name: string, price: number }
@@ -241,7 +341,7 @@ local Order: { [string]: number } = {}; for _,it in ipairs(Catalog) do Order[it.
 
 local marketHeader = Instance.new("TextLabel")
 marketHeader.BackgroundTransparency = 1
-marketHeader.Position = UDim2.new(0, 10, 0, 84) -- under tame section
+marketHeader.Position = UDim2.new(0, 10, 0, 108) -- under tame + overlay
 marketHeader.Size = UDim2.new(1, -20, 0, 20)
 marketHeader.Font = Enum.Font.Code
 marketHeader.TextSize = 16
