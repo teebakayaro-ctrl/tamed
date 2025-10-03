@@ -30,7 +30,9 @@ local function safeWrap(tbl, fnName)
 			print("[Spy] "..fnName.." called:")
 			local args = {...}
 			for i,v in ipairs(args) do
-				if i != 2 then print(" arg["..i.."] = "..dump(v)) end
+				if i ~= 2 then 
+					print(" arg["..i.."] = "..dump(v))
+				end
 			end
 			return old(...)
 		end
