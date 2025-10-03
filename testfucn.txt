@@ -1,63 +1,107 @@
--- LassoArg13Spy.client.lua
+-- MergedTameSpy.client.lua
+-- 1) Lasso._hit wrapper (prints only arg[1], arg[3])
+-- 2) Outbound-only remote logger via __namecall (read-only)
+
 local RS = game:GetService("ReplicatedStorage")
-local repFolder = RS:WaitForChild("_replicationFolder")
-local ok, Lasso = pcall(require, repFolder:WaitForChild("Lasso"))
 
--- dumper สั้น ๆ ไม่สแปม
-local function brief(v, depth, seen)
-	depth = depth or 0; seen = seen or {}
-	local t = typeof(v)
-	if t == "table" then
-		if seen[v] then return "{<cycle>}" end
-		seen[v] = true
-		local keys, n = {}, 0
-		for k,_ in pairs(v) do
-			n += 1
-			if #keys < 6 then table.insert(keys, tostring(k)) end
-		end
-		return "table{"..table.concat(keys,",")..(n > 6 and ",..." or "").."}"
-	elseif t == "Instance" then
-		return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
-	else
-		return ("%s(%s)"):format(t, tostring(v))
-	end
+----------------------------------------------------------------------
+-- brief printers (keep output short)
+----------------------------------------------------------------------
+local function fullname(i)
+  local p, t = i, {}
+  while p do t[#t+1] = p.Name; p = p.Parent end
+  for a=1,#t//2 do t[a],t[#t-a+1]=t[#t-a+1],t[a] end
+  return table.concat(t,".")
 end
 
-local function printOnly13(args)
-	-- arg[1]
-	if args[1] ~= nil then
-		print(" arg[1] = "..brief(args[1]))
-	end
-	-- arg[3] (ถ้ามี)
-	if args[3] ~= nil then
-		print(" arg[3] = "..brief(args[3]))
-	end
+local function brief(v, depth)
+  depth = depth or 0
+  if depth > 1 then return "..." end
+  local ty = typeof(v)
+  if ty == "table" then
+    local keys, n = {}, 0
+    for k,_ in pairs(v) do
+      n += 1
+      if #keys < 6 then table.insert(keys, tostring(k)) end
+    end
+    return ("table{%s%s}"):format(table.concat(keys,","), n>6 and ",..." or "")
+  elseif ty == "Instance" then
+    return ("Instance<%s>:%s"):format(v.ClassName, v.Name)
+  elseif ty == "Vector3" or ty == "CFrame" or ty == "UDim2" then
+    return ty.."("..tostring(v)..")"
+  else
+    return ("%s(%s)"):format(ty, tostring(v))
+  end
 end
 
-local function safeWrap(tbl, fnName)
-	local f = tbl and tbl[fnName]
-	if type(f) ~= "function" then
-		print(("[Spy] %s not a function (type=%s)"):format(fnName, typeof(f)))
-		return
-	end
-	tbl[fnName] = function(...)
-		local a = {...}
-		print("[Spy] "..fnName.." called:")
-		printOnly13(a)
-		-- เรียกของเดิมแบบปลอดภัย
-		local okCall, r1, r2, r3, r4 = pcall(f, table.unpack(a))
-		if not okCall then
-			warn("[Spy] "..fnName.." error: ", r1)
-			return nil
-		end
-		return r1, r2, r3, r4
-	end
-	print("[Spy] Wrapped "..fnName.." (printing only arg[1], arg[3])")
+local function show13(args)
+  if args[1] ~= nil then print("  arg[1] =", brief(args[1])) end
+  if args[3] ~= nil then print("  arg[3] =", brief(args[3])) end
 end
 
-if ok and type(Lasso) == "table" then
-	safeWrap(Lasso, "_hit")
-	safeWrap(Lasso, "doLasso")
-else
-	warn("[Spy] Could not require Lasso module.")
+----------------------------------------------------------------------
+-- (A) Lasso._hit wrapper (safe)
+----------------------------------------------------------------------
+do
+  local repFolder = RS:FindFirstChild("_replicationFolder")
+  if repFolder then
+    local lassoMod = repFolder:FindFirstChild("Lasso")
+    if lassoMod and lassoMod:IsA("ModuleScript") then
+      local okReq, Lasso = pcall(require, lassoMod)
+      if okReq and type(Lasso) == "table" then
+        local f = rawget(Lasso, "_hit")
+        if type(f) == "function" then
+          Lasso._hit = function(...)
+            local a = { ... }
+            print("[Spy] _hit called:")
+            show13(a)  -- print only arg[1], arg[3]
+            local ok, r1, r2, r3, r4 = pcall(f, table.unpack(a))
+            if not ok then warn("[Spy] _hit error:", r1) return end
+            return r1, r2, r3, r4
+          end
+          print("[Spy] Wrapped _hit (printing only arg[1], arg[3])")
+        else
+          print("[Spy] _hit not a function (type="..typeof(f)..")")
+        end
+      else
+        print("[Spy] require(Lasso) failed:", tostring(Lasso))
+      end
+    else
+      print("[Spy] Lasso ModuleScript not found; skip _hit wrap")
+    end
+  else
+    print("[Spy] _replicationFolder not found; skip _hit wrap")
+  end
 end
+
+----------------------------------------------------------------------
+-- (B) Outbound-only remote spy (FireServer / InvokeServer)
+--     Read-only: does NOT set OnClientInvoke, does NOT mutate game logic
+----------------------------------------------------------------------
+do
+  local ok, mt = pcall(getrawmetatable, game)
+  if ok and mt and mt.__namecall then
+    local old = mt.__namecall
+    pcall(function() setreadonly(mt, false) end)
+    mt.__namecall = function(self, ...)
+      local m = getnamecallmethod and getnamecallmethod() or ""
+      if (m == "FireServer" or m == "InvokeServer")
+         and typeof(self) == "Instance"
+         and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction")) then
+        local args = { ... }
+        -- concise arg summary
+        local parts = {}
+        for i,v in ipairs(args) do parts[#parts+1] = ("[%d] %s"):format(i, brief(v)) end
+        print(("\n[Outbound] %s -> %s"):format(m, self:GetFullName()))
+        print("   Args: "..table.concat(parts, " | "))
+      end
+      return old(self, ...)
+    end
+    pcall(function() setreadonly(mt, true) end)
+    print("[OutboundSpy] active (read-only)")
+  else
+    warn("[OutboundSpy] __namecall hook unavailable here.")
+  end
+end
+
+print("[MergedTameSpy] Ready. Do a normal tame; watch _hit (arg1,arg3) and outbound remotes.")
