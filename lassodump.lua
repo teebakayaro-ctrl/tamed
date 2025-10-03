@@ -1,99 +1,62 @@
--- Lasso Spy v1.0
--- Paste into executor (Synapse/Script-Ware/etc).
--- Non-destructive: forwards every call to original method.
+-- Lasso Spy v1.1 (compat-safe)
+-- Non-destructive Remote spy limited to ReplicatedStorage._replicationFolder.Lasso
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService") -- only used for pretty JSON if available
+local HttpService = game:GetService("HttpService")
 
--- Adjust this path if folder name differs
+-- ====== helpers / shims ======
+local function exists(x) return type(x) ~= "nil" end
+local has = {
+    hookmetamethod = exists(hookmetamethod),
+    getnamecallmethod = exists(getnamecallmethod),
+    checkcaller = exists(checkcaller),
+    newcclosure = exists(newcclosure),
+    getrawmetatable = pcall(getrawmetatable, game),
+    setreadonly = exists(setreadonly),
+}
+local getnc = has.getnamecallmethod and getnamecallmethod or function() return "" end
+local isCaller = has.checkcaller and checkcaller or function() return false end
+
+local function safeToString(v)
+    local t = typeof(v)
+    if t == "Instance" then
+        return ("<%s:%s>"):format(v.ClassName, v:GetFullName())
+    elseif t == "Vector3" or t == "CFrame" or t == "Vector2" or t == "UDim2" or t == "Color3" then
+        return tostring(v)
+    elseif t == "table" then
+        local ok, enc = pcall(function() return HttpService:JSONEncode(v) end)
+        return ok and enc or tostring(v)
+    else
+        return tostring(v)
+    end
+end
+
+local function argsPreview(t)
+    local out = {}
+    for i = 1, select("#", t) do
+        local v = select(i, t)
+        out[#out+1] = safeToString(v)
+    end
+    return table.concat(out, ", ")
+end
+
+local function captureStack()
+    local ok, tb = pcall(function() return debug.traceback("", 3) end)
+    return ok and tb or ""
+end
+
+-- ====== find target ======
 local replicationRoot = ReplicatedStorage:FindFirstChild("_replicationFolder", true)
 if not replicationRoot then
-    warn("Replication root '_replicationFolder' not found in ReplicatedStorage.")
-    return
+    return warn("[LASSO-SPY] _replicationFolder not found under ReplicatedStorage")
 end
-
 local target = replicationRoot:FindFirstChild("Lasso", true)
 if not target then
-    warn("Target 'Lasso' not found under _replicationFolder.")
-    return
+    return warn("[LASSO-SPY] Lasso not found under _replicationFolder")
 end
 
--- global log store (accessible from other scripts in executor)
-_G.__LASSO_SPY_LOGS = _G.__LASSO_SPY_LOGS or {}
-
-local function prettyPrint(...)
-    local ok, encoded = pcall(function()
-        local t = {...}
-        return HttpService:JSONEncode(t)
-    end)
-    if ok then
-        return encoded
-    else
-        -- fallback
-        local parts = {}
-        for i=1,select("#", ...) do
-            local v = select(i, ...)
-            table.insert(parts, tostring(v))
-        end
-        return table.concat(parts, ", ")
-    end
-end
-
-local function dumpInstance(inst, indent, maxDepth, visited)
-    indent = indent or ""
-    maxDepth = maxDepth or 3
-    visited = visited or {}
-    if visited[inst] or maxDepth < 0 then
-        return indent .. tostring(inst) .. " (already/too deep)\n"
-    end
-    visited[inst] = true
-
-    local out = {}
-    table.insert(out, indent .. string.format("%s (%s)", inst.Name, inst.ClassName))
-    -- print some useful properties for common classes
-    if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
-        table.insert(out, indent .. "  -> Remote (Event/Function)")
-    elseif inst:IsA("ModuleScript") then
-        table.insert(out, indent .. "  -> ModuleScript")
-    end
-
-    -- show custom properties if exist
-    local propList = {"Name", "ClassName", "Archivable", "Parent"}
-    for _, p in ipairs(propList) do
-        local ok, val = pcall(function() return inst[p] end)
-        if ok and val ~= nil then
-            table.insert(out, indent .. string.format("  %s: %s", p, tostring(val)))
-        end
-    end
-
-    -- children
-    local children = inst:GetChildren()
-    if #children > 0 then
-        table.insert(out, indent .. "  Children:")
-        for _, c in ipairs(children) do
-            table.insert(out, dumpInstance(c, indent .. "    ", maxDepth - 1, visited))
-        end
-    end
-    return table.concat(out, "\n")
-end
-
--- print initial dump
-print("=== LASSO SPY: DUMP ===")
-print(dumpInstance(target, "", 4))
-print("=== END DUMP ===")
-
--- Helper to push to global logs (keeps small bounded buffer)
-local function push_log(item)
-    local logs = _G.__LASSO_SPY_LOGS
-    table.insert(logs, 1, item)
-    if #logs > 500 then -- keep recent 500
-        for i=501,#logs do logs[i] = nil end
-    end
-end
-
--- Utility: check whether an instance is under target
 local function isUnderTarget(inst)
-    if not inst or not inst:IsA("Instance") then return false end
+    if not inst or typeof(inst) ~= "Instance" then return false end
     local cur = inst
     while cur do
         if cur == target then return true end
@@ -102,122 +65,140 @@ local function isUnderTarget(inst)
     return false
 end
 
--- Hook __namecall to intercept RemoteEvent/RemoteFunction calls under target
-local mt = getrawmetatable(game)
-local oldNamecall = mt.__namecall
-local newNamecall
-local getNamecallMethod = getnamecallmethod or function() return "" end
-local checkCall = checkcaller or function() return false end
-
--- helper to capture stack (caller) without flooding
-local function getCallerStack()
-    local stack = ""
-    -- xpcall to avoid breaking if debug.traceback unavailable
-    local ok, tb = pcall(function() return debug.traceback("", 2) end)
-    if ok and tb then
-        stack = tb
+-- ====== dump (light) ======
+local function lightDump(inst, depth, indent)
+    depth = depth or 3
+    indent = indent or ""
+    if depth < 0 then return end
+    print(("%s%s (%s)"):format(indent, inst.Name, inst.ClassName))
+    for _, c in ipairs(inst:GetChildren()) do
+        lightDump(c, depth - 1, indent .. "  ")
     end
-    return stack
 end
 
-newNamecall = newcclosure(function(self, ...)
-    local method = getNamecallMethod()
-    local argCount = select("#", ...)
-    local args = {}
-    for i=1, argCount do args[i] = select(i, ...) end
+print("=== LASSO-SPY: LIGHT DUMP ===")
+lightDump(target, 4, "")
+print("=== END DUMP ===")
 
-    local handled = false
-    local logEntry
+_G.__LASSO_SPY_LOGS = _G.__LASSO_SPY_LOGS or {}
+local function push_log(entry)
+    table.insert(_G.__LASSO_SPY_LOGS, 1, entry)
+    if #_G.__LASSO_SPY_LOGS > 500 then
+        for i=501, #_G.__LASSO_SPY_LOGS do _G.__LASSO_SPY_LOGS[i] = nil end
+    end
+end
 
-    -- If the target (or a child) is the receiver, and method is one of interest
-    if isUnderTarget(self) then
-        if method == "FireServer" or method == "FireClient" or method == "FireAllClients" or
-           method == "InvokeServer" or method == "InvokeClient" then
-
-            -- collect log info
-            logEntry = {
+-- ====== hook strategy A: hookmetamethod (preferred) ======
+local hooked = false
+if has.hookmetamethod then
+    local old
+    old = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnc()
+        -- ignore calls originating from us to reduce noise
+        if isUnderTarget(self) and (method == "FireServer" or method == "FireClient" or method == "FireAllClients" or method == "InvokeServer" or method == "InvokeClient") then
+            local packed = table.pack(...)
+            local logEntry = {
                 time = os.time(),
                 method = method,
-                receiver = tostring(self:GetFullName()),
-                receiverClass = self.ClassName,
-                args = args,
-                callerStack = getCallerStack(),
+                receiver = self and self:GetFullName() or tostring(self),
+                class = self and self.ClassName or "Unknown",
+                argsPreview = argsPreview(packed),
+                callerStack = captureStack(),
+                originIsScript = isCaller(),
             }
-
-            -- For invokes, call and capture return
-            if method:match("^Invoke") then
-                local success, ret1, ret2, ret3 = pcall(function()
-                    return oldNamecall(self, ...)
-                end)
-                logEntry.invokeSuccess = success
-                if success then
-                    -- if returned multiple values, capture them in table
-                    local retvals = {}
-                    if ret1 ~= nil then retvals[1] = ret1 end
-                    if ret2 ~= nil then retvals[2] = ret2 end
-                    if ret3 ~= nil then retvals[3] = ret3 end
-                    logEntry.returns = retvals
+            if method:sub(1,6) == "Invoke" then
+                local ok, r1, r2, r3 = pcall(old, self, ...)
+                logEntry.invokeSuccess = ok
+                if ok then
+                    logEntry.returnsPreview = argsPreview(table.pack(r1, r2, r3))
                 else
-                    logEntry.error = tostring(ret1)
+                    logEntry.error = tostring(r1)
                 end
-
-                -- push to logs and also print short summary
                 push_log(logEntry)
-                print(string.format("[LASSO-SPY] %s -> %s args=%d invokeSucc=%s returns=%s",
-                    logEntry.receiver, logEntry.method, #args,
-                    tostring(logEntry.invokeSuccess),
-                    prettyPrint(unpack(logEntry.returns or {}))
-                ))
-
-                -- return the actual result or rethrow if failed
-                if logEntry.invokeSuccess then
-                    return unpack(logEntry.returns or {})
+                print(("[LASSO-SPY] %s -> %s | args=[%s] | ok=%s | ret=[%s]"):format(logEntry.receiver, method, logEntry.argsPreview, tostring(ok), logEntry.returnsPreview or ""))
+                if ok then
+                    return r1, r2, r3
                 else
-                    -- re-throw original error to preserve behavior
                     error(logEntry.error)
                 end
             else
-                -- Fire* : just forward and log
-                local ok, err = pcall(function()
-                    oldNamecall(self, ...)
-                end)
+                local ok, err = pcall(old, self, ...)
                 logEntry.fireSuccess = ok
                 if not ok then logEntry.error = tostring(err) end
                 push_log(logEntry)
-                print(string.format("[LASSO-SPY] %s -> %s args=%d success=%s",
-                    logEntry.receiver, logEntry.method, #args, tostring(ok)))
-                return nil
+                print(("[LASSO-SPY] %s -> %s | args=[%s] | ok=%s"):format(logEntry.receiver, method, logEntry.argsPreview, tostring(ok)))
+                return
             end
         end
-    end
+        return old(self, ...)
+    end)
+    hooked = true
+end
 
-    -- default fallback - not related to Lasso: forward
-    return oldNamecall(self, ...)
+-- ====== hook strategy B: raw metatable fallback (only if needed) ======
+if not hooked and has.getrawmetatable then
+    local mt = getrawmetatable(game)
+    if mt and type(mt.__namecall) == "function" then
+        local oldNamecall = mt.__namecall
+        if has.setreadonly then setreadonly(mt, false) end
+        mt.__namecall = (has.newcclosure and newcclosure or function(f) return f end)(function(self, ...)
+            local method = getnc()
+            if isUnderTarget(self) and (method == "FireServer" or method == "FireClient" or method == "FireAllClients" or method == "InvokeServer" or method == "InvokeClient") then
+                local packed = table.pack(...)
+                local logEntry = {
+                    time = os.time(),
+                    method = method,
+                    receiver = self and self:GetFullName() or tostring(self),
+                    class = self and self.ClassName or "Unknown",
+                    argsPreview = argsPreview(packed),
+                    callerStack = captureStack(),
+                    originIsScript = isCaller(),
+                }
+                if method:sub(1,6) == "Invoke" then
+                    local ok, r1, r2, r3 = pcall(oldNamecall, self, ...)
+                    logEntry.invokeSuccess = ok
+                    if ok then
+                        logEntry.returnsPreview = argsPreview(table.pack(r1, r2, r3))
+                    else
+                        logEntry.error = tostring(r1)
+                    end
+                    push_log(logEntry)
+                    print(("[LASSO-SPY] %s -> %s | args=[%s] | ok=%s | ret=[%s]"):format(logEntry.receiver, method, logEntry.argsPreview, tostring(ok), logEntry.returnsPreview or ""))
+                    if ok then
+                        return r1, r2, r3
+                    else
+                        error(logEntry.error)
+                    end
+                else
+                    local ok, err = pcall(oldNamecall, self, ...)
+                    logEntry.fireSuccess = ok
+                    if not ok then logEntry.error = tostring(err) end
+                    push_log(logEntry)
+                    print(("[LASSO-SPY] %s -> %s | args=[%s] | ok=%s"):format(logEntry.receiver, method, logEntry.argsPreview, tostring(ok)))
+                    return
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+        if has.setreadonly then setreadonly(mt, true) end
+        hooked = true
+    end
+end
+
+if not hooked then
+    warn("[LASSO-SPY] Could not hook __namecall (no hookmetamethod and raw mt unsafe). Your executor may not support this.")
+else
+    print("[LASSO-SPY] Hook active. Watching remotes under: " .. target:GetFullName())
+end
+
+-- notify when new remotes appear
+target.DescendantAdded:Connect(function(d)
+    if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+        print("[LASSO-SPY] New remote: " .. d:GetFullName() .. " (" .. d.ClassName .. ")")
+    end
 end)
 
--- set the new __namecall
-setreadonly(mt, false)
-mt.__namecall = newNamecall
-setreadonly(mt, true)
-
-print("[LASSO-SPY] Hooked __namecall. Logging remote calls for instances under:", target:GetFullName())
-
--- Auto-watch future children added under target
-local function onDescendantAdded(desc)
-    if desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction") then
-        print("[LASSO-SPY] New remote detected:", desc:GetFullName(), "(" .. desc.ClassName .. ")")
-    end
-end
-target.DescendantAdded:Connect(onDescendantAdded)
-
--- Expose helper functions for use in executor console
-_G.LassoSpyDump = function(depth)
-    depth = depth or 4
-    local txt = dumpInstance(target, "", depth)
-    print(txt)
-    return txt
-end
-
+-- handy globals
 _G.LassoSpyGetLogs = function(max)
     max = max or 50
     local out = {}
@@ -226,5 +207,7 @@ _G.LassoSpyGetLogs = function(max)
     end
     return out
 end
-
-print("[LASSO-SPY] Ready. Use LassoSpyDump(), LassoSpyGetLogs() to inspect.")
+_G.LassoSpyDump = function(depth)
+    depth = depth or 4
+    lightDump(target, depth, "")
+end
